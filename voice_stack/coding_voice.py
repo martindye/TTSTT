@@ -94,6 +94,31 @@ class SpokenTurn:
         self.spoken_text = ""
         self.buf = ""
         self.block_type: dict[int, str] = {}
+        self._paused = False
+        self._pending: list[str] = []
+
+    def set_paused(self, paused: bool) -> None:
+        """While paused (agent busy) sentences are buffered, not spoken; on
+        un-pause the buffer is played back (in its own thread, so the event
+        loop is never blocked)."""
+        self._paused = paused
+        if not paused and self._pending:
+            threading.Thread(target=self._drain, daemon=True).start()
+
+    def _drain(self) -> None:
+        while self._pending and not self.cancel.is_set():
+            self._speak(self._pending.pop(0))
+
+    MAX_PENDING = 20  # ~2 min of speech; drop oldest beyond that
+
+    def speak_now(self, sentence: str) -> None:
+        """Speak immediately even while paused (canned lines)."""
+        was_paused = self._paused
+        self._paused = False
+        try:
+            self._speak(sentence)
+        finally:
+            self._paused = was_paused
 
     # -- live chunk stream (StreamChunk protocol, as in assistant/chunk) ----
     def feed(self, chunk: dict) -> None:
@@ -121,6 +146,15 @@ class SpokenTurn:
     def _speak(self, sentence: str) -> None:
         sentence = sentence.strip()
         if not sentence or self.cancel.is_set():
+            return
+        if self._paused:
+            # Agent is busy: buffer the text, skip TTS (no CPU burn, no
+            # audio), and catch up when the turn ends. Count it in
+            # spoken_text so snapshot replay can't speak it a second time.
+            self._pending.append(sentence)
+            if len(self._pending) > self.MAX_PENDING:
+                self._pending.pop(0)
+            self.spoken_text += sentence + " "
             return
         try:
             for audio in self.tts.stream_sentence(sentence, self.cancel):
@@ -260,10 +294,11 @@ class CodingVoice:
     """Mic -> STT -> gateway inject; session stream -> spoken reply -> TTS."""
 
     def __init__(self, stt, tts, gw: GatewaySession,
-                 mic_device=None, spk_device=None):
+                 mic_device=None, spk_device=None, utterance_max=120.0):
         self.stt = stt
         self.tts = tts
         self.gw = gw
+        self._utterance_max = utterance_max  # s; long-utterance safety cap
         self.speakers = SpeakerPlayback(sample_rate=tts.sample_rate,
                                         device=spk_device)
         self.mic = MicCapture(callback=self._on_mic_block,
@@ -290,6 +325,12 @@ class CodingVoice:
         self._floor_since = 0.0
         self._last_chunk_at = 0.0
         self._inject_at_ms = 0
+        # Endpointing: when the current utterance started + keep-open state.
+        self._utterance_start = 0.0
+        # Agent-busy: while a turn of THIS session is running, speech output
+        # is buffered (no TTS, no CPU) and flushed when the turn ends.
+        self._busy = False
+        self._busy_notified = False
 
     # ------------------------------------------------------------ echo guard
     def _note_audio(self) -> None:
@@ -338,6 +379,8 @@ class CodingVoice:
             return
         if self._audible():
             return
+        if not self._pieces:
+            self._utterance_start = time.time()
         self._pieces.append(piece)
         self._last_piece = piece
         self._arm_timer()
@@ -353,12 +396,36 @@ class CodingVoice:
         self._timer.start()
 
     def _send(self) -> None:
+        """Fired after a word gap. Send now if the utterance looks complete
+        or has hit the max length; otherwise keep the door open — the user
+        may just be pausing mid-thought."""
         if self._timer:
             self._timer.cancel()
             self._timer = None
+        if not self._pieces:
+            return
+        text = "".join(self._pieces)
+        words = len(text.split())
+        last = (self._last_piece or "").lstrip("\u2581").strip()
+        final = last in SENTENCE_END_PUNCT
+        age = time.time() - self._utterance_start
+        if final and words <= 14:
+            pass  # complete short utterance ("what's the weather?")
+        elif not final and words <= 8:
+            pass  # short command without punctuation ("fix the login bug")
+        elif age >= self._utterance_max:
+            log(f"utterance max ({self._utterance_max:.0f}s) reached, sending")
+        else:
+            # Incomplete or long: hold the door open, recheck after the gap.
+            self._arm_timer()
+            return
+        self._do_send()
+
+    def _do_send(self) -> None:
         text = "".join(self._pieces)
         self._pieces = []
         self._last_piece = ""
+        self._utterance_start = 0.0
         text = text.replace("\u2581", " ")
         while "  " in text:
             text = text.replace("  ", " ")
@@ -371,6 +438,9 @@ class CodingVoice:
         self._turn_done.clear()
         self._floor.set()
         self._floor_since = time.time()
+        if self._busy and not self._busy_notified:
+            self._busy_notified = True
+            self.spoken.speak_now("I'm still working on it. One moment.")
         try:
             self.gw.inject(text)
         except Exception as e:
@@ -378,9 +448,22 @@ class CodingVoice:
             log(f"inject failed: {e}")
 
     # --------------------------------------------------- session stream in
+    def _set_busy(self, busy: bool) -> None:
+        if busy == self._busy:
+            return
+        self._busy = busy
+        if busy:
+            self._busy_notified = False
+            self.spoken.set_paused(True)
+            log("agent busy — pausing speech (buffering its reply)")
+        else:
+            self.spoken.set_paused(False)
+            log("agent done — speaking buffered reply")
+
     def _on_event(self, ev: dict) -> None:
         t = ev.get("type")
         if t == "assistant/chunk":
+            self._set_busy(True)
             chunk = (ev.get("data") or {}).get("chunk")
             if isinstance(chunk, dict):
                 self._last_chunk_at = time.time()
@@ -396,6 +479,7 @@ class CodingVoice:
                 self._seen_msg_seqs.add(seq)
         elif t == "turn/end":
             self._turn_done.set()
+            self._set_busy(False)
 
     def _on_snapshot(self, snap: dict) -> None:
         """Replay what the live stream missed — and only that.
@@ -467,6 +551,7 @@ class CodingVoice:
                 seq = ev.get("seq") or 0
                 if et == "chunkrow/text-chunks" and seq > self._chunk_seq:
                     self._chunk_seq = seq
+                    self._set_busy(True)  # a turn is in flight
                     data = ev.get("data") or {}
                     if isinstance(data, dict):
                         idx = data.get("index", 0)
@@ -552,7 +637,27 @@ def main() -> int:
                     choices=["auto", "cuda", "cpu"])
     ap.add_argument("--spk-device", type=int, default=None)
     ap.add_argument("--mic-device", type=int, default=None)
+    ap.add_argument("--utterance-max", type=float, default=120.0,
+                    help="max seconds a spoken utterance may run before it "
+                         "is sent anyway (default 120)")
+    ap.add_argument("--list-voices", action="store_true",
+                    help="print the available TTS voices and exit")
     args = ap.parse_args()
+
+    if args.list_voices:
+        try:
+            from pocket_tts.utils.utils import _ORIGINS_OF_PREDEFINED_VOICES as V
+            names = list(V)
+        except Exception:
+            names = ["anna", "vera", "fantine", "eponine", "azelma", "mary",
+                     "jane", "eve", "cosette", "caro_davy", "alba", "jean",
+                     "charles", "paul", "george", "michael", "marius",
+                     "javert", "bill_boerst", "peter_yearsley",
+                     "stuart_bell"]
+        print("Available --tts-voice names:")
+        for n in names:
+            print(f"  {n}")
+        return 0
 
     gui = args.gui.rstrip("/")
     authority = re.sub(r"^https?://", "", gui).split("/")[0]
@@ -569,7 +674,8 @@ def main() -> int:
                    args.tts_quantize == "int4")
 
     cv = CodingVoice(stt, tts, gw,
-                     mic_device=args.mic_device, spk_device=args.spk_device)
+                     mic_device=args.mic_device, spk_device=args.spk_device,
+                     utterance_max=args.utterance_max)
     cv.start()
     try:
         while True:
