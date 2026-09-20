@@ -807,6 +807,18 @@ def _pick_session(args) -> str:
 
 def main() -> int:
     import argparse
+    import atexit
+    import faulthandler
+
+    # Death forensics: the bridge has died once with no trace at all.
+    # faulthandler dumps all threads on fatal signals (segfault & co);
+    # atexit marks a clean exit; the thread hook catches runaway threads
+    # whose exception would otherwise vanish into a daemon thread.
+    faulthandler.enable()
+    atexit.register(lambda: log("process exiting (clean exit path)"))
+    threading.excepthook = lambda info: log(
+        f"UNCAUGHT exception in thread {info.thread.name}: "
+        f"{info.exc_type.__name__}: {info.exc_value}")
 
     ap = argparse.ArgumentParser(description="Coding Voice: speak into the coding chat")
     ap.add_argument("--gui", default="http://127.0.0.1:3080")

@@ -30,9 +30,10 @@ command (below) for that run. `anna` is the default.
 
 It is running if the last line is recent and recent lines show no repeated
 `follow stream error`. `coding-voice: ready — speaking into session ...`
-marks a successful boot. An old/absent log = not running. Never start a second
-instance (two processes would fight over the microphone) — stop the old one
-first.
+marks a successful boot. An old/absent log = not running (the supervisor
+re-truncates the log on each start, so its tail is always the live run).
+Never start a second instance (two processes would fight over the
+microphone) — stop the old one first.
 
 ## Start
 
@@ -44,13 +45,15 @@ first.
    (A 401 is fine — it means the gateway is up and wants a cookie.)
    If it fails, tell the user the DSH web app must be open first and stop here.
 
-2. Make sure the log dir exists, then start the bridge as a background pwsh
-   job (workdir `C:\Users\press\OneDrive\Projects\TTSTT`,
-   `run_in_background: true`). The log lives OUTSIDE the OneDrive-synced
-   project dir on purpose:
+2. Make sure the log dir exists, then start the bridge via its supervisor
+   as a background pwsh job (workdir `C:\Users\press\OneDrive\Projects\TTSTT`,
+   `run_in_background: true`). The supervisor restarts the bridge if it dies,
+   and keeps the dead run's log as `coding_voice.prev.log` (crash forensics).
+   The log lives OUTSIDE the OneDrive-synced project dir on purpose. Extra
+   options go after the script name (e.g. `--tts-voice anna`):
 
        New-Item -ItemType Directory -Force C:\Users\press\.dsh\logs | Out-Null
-       python -X utf8 -m voice_stack.coding_voice 2>&1 | Out-File -Encoding utf8 C:\Users\press\.dsh\logs\coding_voice.log
+       powershell -NoProfile -File voice_stack\supervise_coding_voice.ps1
 
 3. Give it 30-40 seconds (STT ~10s, TTS ~5s, follow stream open), then confirm
    `ready — speaking into session session-...` appears in
@@ -102,14 +105,24 @@ To go back to this coding chat: stop the bridge and start it without
 
 ## Stop
 
+Create the stop sentinel FIRST (so the supervisor does not restart the
+bridge), then kill the python process:
+
+    New-Item C:\Users\press\.dsh\logs\coding_voice.STOP -ItemType File -Force
     Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
       Where-Object { $_.CommandLine -like '*voice_stack.coding_voice*' } |
       ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 
-Confirm the process is gone, then report.
+Then confirm `supervisor stopped` appears in
+`C:\Users\press\.dsh\logs\coding_voice_supervisor.log` (the supervisor
+removes the sentinel itself when it exits).
 
 ## Notes
 
+- The supervisor auto-restarts the bridge on unexpected death; the dead
+  run's log is kept as `coding_voice.prev.log` and supervisor actions are
+  in `coding_voice_supervisor.log`. If the voice is dead, check those two
+  files first.
 - Half-duplex: while the bridge is holding the floor (from the user's
   utterance until the reply's audio has finished playing) the microphone is
   closed; the user speaks again after the reply is done.
