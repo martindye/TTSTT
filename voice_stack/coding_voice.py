@@ -64,6 +64,36 @@ COMMAND_SILENCE_S = 6.0
 LONG_FINAL_SILENCE_S = 3.0
 SENTENCE_END_PUNCT = {".", "!", "?", "\u2026", "\u3002", "\uff01", "\uff1f"}
 
+# STT model choices ("--stt-model"). The 2.6B model is English-only and the
+# most accurate Kyutai release, at the cost of ~2 s more delay and ~7 GB of
+# VRAM (weights + mimi + KV).
+STT_MODEL_REPOS = {
+    "fast": "kyutai/stt-1b-en_fr",
+    "accurate": "kyutai/stt-2.6b-en",
+}
+# Free VRAM needed before the accurate model is even attempted.
+ACCURATE_MIN_FREE_VRAM = 8 * 1024**3
+
+
+def _free_vram_bytes() -> int | None:
+    """Free GPU memory in bytes, via nvidia-smi (no CUDA context is created,
+    so this never blocks the way a torch call would on a busy GPU).
+    Returns None when no NVIDIA GPU / nvidia-smi is available."""
+    import shutil
+    import subprocess
+
+    if shutil.which("nvidia-smi") is None:
+        return None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return int(out.stdout.strip().splitlines()[0]) * 1024 * 1024
+    except Exception:
+        return None
+
 # Half-duplex: ignore the mic this long after our own audio stops.
 VOICE_TAIL_S = 1.0
 
@@ -790,7 +820,15 @@ def main() -> int:
     ap.add_argument("--tts-voice", default="anna")
     ap.add_argument("--tts-language", default="english")
     ap.add_argument("--tts-quantize", default="int4", choices=["int4", "none"])
-    ap.add_argument("--stt-repo", default="kyutai/stt-1b-en_fr")
+    ap.add_argument("--stt-model", default="fast",
+                    choices=sorted(STT_MODEL_REPOS),
+                    help="STT model. fast = stt-1b-en_fr, ~0.5 s delay "
+                         "(default). accurate = stt-2.6b-en, noticeably more "
+                         "accurate but ~2.5 s delay and ~7 GB of free VRAM; "
+                         "first use downloads the model.")
+    ap.add_argument("--stt-repo", default=None,
+                    help="override: exact Hugging Face repo for the STT "
+                         "model (beats --stt-model)")
     ap.add_argument("--stt-device", default="cuda",
                     choices=["auto", "cuda", "cpu"])
     ap.add_argument("--spk-device", type=int, default=None)
@@ -827,7 +865,18 @@ def main() -> int:
     gw = GatewaySession(gui, session_id, authority, secret)
     log(f"GUI: {gui}  session: {session_id}")
 
-    stt = make_stt(args.stt_repo, args.stt_device)
+    stt_repo = args.stt_repo or STT_MODEL_REPOS[args.stt_model]
+    log(f"STT model: {args.stt_model} ({stt_repo})")
+    if args.stt_model == "accurate" and not args.stt_repo \
+            and args.stt_device in ("cuda", "auto"):
+        free = _free_vram_bytes()
+        if free is not None and free < ACCURATE_MIN_FREE_VRAM:
+            raise SystemExit(
+                f"the 'accurate' STT model (stt-2.6b-en) needs ~7 GB of "
+                f"free VRAM but only {free / 1024 / 1024:.0f} MB is free "
+                "right now. Free up the GPU (e.g. stop the big LLM "
+                "server) or start with --stt-model fast.")
+    stt = make_stt(stt_repo, args.stt_device)
     tts = make_tts(args.tts_language, args.tts_voice,
                    args.tts_quantize == "int4")
 

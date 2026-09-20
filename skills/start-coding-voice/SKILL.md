@@ -62,6 +62,13 @@ Useful options (append to the command):
   the TTSTT workspace (this coding chat).
 - `--session <id>` — target a specific session id. Default: the most recently
   written session of the target workspace.
+- `--stt-model <fast|accurate>` — speech recognition model. `fast` (default)
+  is kyutai/stt-1b-en_fr: quick, ~0.5 s delay. `accurate` is
+  kyutai/stt-2.6b-en: noticeably more accurate but ~2.5 s delay, needs ~7 GB
+  of FREE GPU memory (the big LLM server usually takes most of it — if the
+  bridge refuses to start, that's why; free the GPU or stay on fast), and
+  downloads the model on first use. Phrasing: "start coding voice with the
+  accurate model".
 - `--tts-voice <name>` — voice; default `anna`. Run `--list-voices` for the
   full list (anna, vera, fantine, eponine, azelma, mary, jane, eve,
   cosette, caro_davy, alba, jean, charles, paul, george, michael, marius,
