@@ -16,6 +16,15 @@ Run:
 
 --workspace points the voice at another DSH workspace's newest session
 (default: the TTSTT workspace, i.e. this coding chat).
+
+Auto-follow: unless the target is pinned with --session, the bridge keeps
+re-resolving the newest-WRITTEN session of the target workspace. A session
+file's mtime moves when the session receives activity, so this tracks the
+window the user is talking to: a newly opened window becomes newest as soon
+as it exists, and an active reply keeps its window newest while the agent
+works. Switches are debounced over two polls and never happen mid-turn.
+A window that is merely looked at (nothing landed in it yet) is picked up
+the moment anything lands in it.
 """
 
 from __future__ import annotations
@@ -45,7 +54,6 @@ from .audio_io import MicCapture, SpeakerPlayback  # noqa: E402
 from .assistant import split_sentence  # noqa: E402
 from .voice_dsh import make_stt, make_tts  # noqa: E402
 from .handoff import (  # noqa: E402
-    find_target_session,
     load_browser_secret,
     mint_cookie,
     sessions_dir_for,
@@ -294,12 +302,18 @@ class GatewaySession:
         """Follow the session's event stream, cycling the connection every
         STREAM_CYCLE_S. on_event(ev) per live session event; on_snapshot(snap)
         per opening snapshot frame. Reconnects with backoff until stop.
+
+        The target may change underneath (CodingVoice.retarget, auto-follow):
+        each open follows the session id current AT OPEN TIME, and the read
+        loop drops the stream as soon as it sees the id move, so a retarget
+        reopens within one second instead of waiting for the 50 s cycle.
         """
         import websockets
 
         delay = 1.0
         while not stop.is_set():
             opened_at = 0.0
+            sid = self.session_id  # auto-follow may move this; open for sid
             try:
                 async with websockets.connect(
                     self.gui_url.replace("http://", "ws://") + "/api/remote.mux",
@@ -315,7 +329,7 @@ class GatewaySession:
                         "streamId": stream_id,
                         "endpoint": "session/follow",
                         "payload": {"args": {"request": {
-                            "address": {"kind": "session", "sessionId": self.session_id},
+                            "address": {"kind": "session", "sessionId": sid},
                             "maxMessages": 1,
                         }}},
                     }))
@@ -323,6 +337,8 @@ class GatewaySession:
                     log("follow stream open")
                     delay = 1.0
                     while not stop.is_set():
+                        if self.session_id != sid:
+                            break  # retargeted: reopen for the new session
                         if time.time() - opened_at > STREAM_CYCLE_S:
                             break  # cycle ahead of the server's idle close
                         try:
@@ -375,13 +391,15 @@ class CodingVoice:
         self._stop = threading.Event()
         self._cancel = threading.Event()
         self._audio_end_at = 0.0
-        # Snapshot-replay watermarks (session-global seq space, never reset):
-        # messages handled live are remembered by seq so a 50 s cycle never
-        # re-speaks them; in-flight chunk rows are fed only once, by seq.
+        # Snapshot-replay watermarks (session-global seq space). They are
+        # PER-SESSION: _primed_for names the session they belong to, and a
+        # retarget re-arms them on the new session's first snapshot, so a
+        # 50 s cycle never re-speaks and a switch never crosses streams.
         self._seen_msg_seqs: set[int] = set()
         self._msg_seq = 0
         self._chunk_seq = 0
         self._primed = False
+        self._primed_for: str | None = None
         self.spoken = SpokenTurn(tts, self.speakers, self._note_audio, self._cancel)
         self._stt_queue: queue.Queue = queue.Queue(maxsize=240)
         self._pieces: list[str] = []
@@ -588,6 +606,24 @@ class CodingVoice:
             self._floor.clear()
             log(f"inject failed: {e}")
 
+    # ---------------------------------------------------------- auto-follow
+    def retarget(self, sid: str) -> bool:
+        """Point the bridge at a different session (auto-follow).
+
+        Refused while a turn of the current session is in flight — the
+        caller (SessionFollower) retries on its next poll. The follow stream
+        notices the id change on its own and reopens for the new session
+        (<= 1 s); that session's first snapshot re-arms the watermarks, and
+        any leftover frame from the old session is dropped by the
+        _primed_for / snapshot-header checks. Never double-speaks, never
+        crosses streams.
+        """
+        if sid == self.gw.session_id or self._busy:
+            return False
+        log(f"retarget: {self.gw.session_id} -> {sid}")
+        self.gw.session_id = sid
+        return True
+
     # --------------------------------------------------- session stream in
     def _set_busy(self, busy: bool) -> None:
         if busy == self._busy:
@@ -604,6 +640,12 @@ class CodingVoice:
             log("agent done — speaking buffered reply")
 
     def _on_event(self, ev: dict) -> None:
+        # Drop leftovers from a session we no longer follow (the follow
+        # stream can deliver one or two frames of the old session before it
+        # notices the retarget; _primed_for lags the switch until the new
+        # session's first snapshot re-arms it).
+        if self._primed_for != self.gw.session_id:
+            return
         t = ev.get("type")
         if t == "assistant/chunk":
             self._set_busy(True)
@@ -644,13 +686,22 @@ class CodingVoice:
                 if ev.get("type") == "assistant/message":
                     last_msg = ev
 
-        if not self._primed:
-            # First snapshot: remember where history ends, speak nothing.
+        header = snap.get("header") or {}
+        snap_sid = header.get("id") if isinstance(header, dict) else None
+        if snap_sid and snap_sid != self.gw.session_id:
+            return  # leftover from a stream of a session we no longer follow
+
+        if self._primed_for != self.gw.session_id:
+            # First snapshot of THIS session — a fresh start, or right after
+            # a retarget: re-baseline the watermarks on this session's
+            # history, speak nothing of it. (Per-session seq spaces make
+            # carrying the old session's watermarks over meaningless.)
             self._primed = True
+            self._primed_for = self.gw.session_id
             if last_msg is not None:
                 self._msg_seq = last_msg.get("seq") or 0
-                self._seen_msg_seqs.add(self._msg_seq)
-            self._chunk_seq = max(self._chunk_seq, max_seq)
+                self._seen_msg_seqs = {self._msg_seq}
+            self._chunk_seq = max_seq
             return
 
         # A message that committed while we were away: speak it once.
@@ -785,7 +836,99 @@ def _workspace_sessions_dir(gui_home: str, workspace: str) -> Path | None:
     return cand if cand.is_dir() else None
 
 
-def _pick_session(args) -> str:
+def newest_session(sdir: Path) -> str | None:
+    """Newest session-<...> directory in a workspace session store.
+
+    Non-session artifacts sharing the store (e.g. handoff-<ts> task folders
+    from the voice handoff) are ignored: auto-follow should track the
+    user's chat windows, not one-shot tasks.
+
+    Ties (filesystem timestamp granularity) break deterministically by
+    session id; in practice real activity is far more than a granularity
+    tick apart, so this only matters for synthetic same-instant writes.
+    """
+    best: tuple[float, str] | None = None
+    try:
+        entries = list(sdir.iterdir())
+    except OSError:
+        return None
+    for sd in entries:
+        if not sd.name.startswith("session-"):
+            continue
+        try:
+            if not sd.is_dir():
+                continue
+        except OSError:
+            continue
+        mt = 0.0
+        try:
+            for f in sd.iterdir():
+                if f.is_file():
+                    mt = max(mt, f.stat().st_mtime)
+        except OSError:
+            pass
+        key = (mt, sd.name)
+        if best is None or key > best:
+            best = key
+    return best[1] if best else None
+
+
+class SessionFollower(threading.Thread):
+    """Auto-follow: keep the bridge pointed at the newest-WRITTEN session of
+    the target workspace.
+
+    A session file's mtime moves only when the session receives activity, so
+    'newest written' tracks the window the user is talking to: a freshly
+    opened window becomes newest as soon as it exists, and an active reply
+    keeps its window newest while the agent works. A window that is merely
+    looked at (nothing landed in it yet) is picked up the moment anything
+    lands in it — a true focus signal would need a browser-side heartbeat,
+    which the DSH gateway does not expose.
+
+    A switch needs two consecutive agreeing polls (debounce against an mtime
+    blip) and is refused by retarget() mid-turn (retried on the next poll).
+    """
+
+    def __init__(self, sdir: Path, cv: "CodingVoice",
+                 interval: float = 3.0, stable_polls: int = 2):
+        super().__init__(daemon=True, name="session-follower")
+        self._sdir = sdir
+        self._cv = cv
+        self._interval = interval
+        self._stable = stable_polls
+        self._stop_ev = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_ev.set()
+
+    def run(self) -> None:
+        polls = 0
+        while not self._stop_ev.is_set():
+            if self._stop_ev.wait(self._interval):
+                return
+            try:
+                hit = newest_session(self._sdir)
+            except OSError:
+                continue
+            current = self._cv.gw.session_id
+            if hit and hit != current:
+                polls += 1
+                if polls >= self._stable:
+                    if self._cv.retarget(hit):
+                        log(f"auto-follow: speaking into {hit}")
+                        polls = 0
+                    # else: mid-turn — keep the count, retry next poll
+            else:
+                polls = 0
+
+
+def _resolve_target(args) -> tuple[Path, str]:
+    """(sessions dir, target session id) for the CLI args.
+
+    The dir is what SessionFollower re-scans when auto-follow is on; the id
+    is what the bridge starts on. An explicit --session pins the target and
+    disables auto-follow (main() checks args.session).
+    """
     if args.workspace:
         sdir = _workspace_sessions_dir(args.gui_home,
                                        os.path.normpath(args.workspace))
@@ -798,11 +941,15 @@ def _pick_session(args) -> str:
         if sdir is None:
             raise SystemExit(f"no sessions dir under {args.gui_home}; "
                              "pass --session or --workspace")
-    hit = find_target_session(sdir, args.session)
-    if hit is None:
-        raise SystemExit("no sessions found for that workspace; pass --session")
+    if args.session:
+        hit = args.session
+    else:
+        hit = newest_session(sdir)
+        if hit is None:
+            raise SystemExit("no sessions found for that workspace; "
+                              "pass --session")
     log(f"target session: {hit}")
-    return hit
+    return sdir, hit
 
 
 def main() -> int:
@@ -873,7 +1020,7 @@ def main() -> int:
     secret = load_browser_secret(Path(args.gui_home))
     if secret is None:
         raise SystemExit(f"cannot read browser secret from {args.gui_home}")
-    session_id = _pick_session(args)
+    sdir, session_id = _resolve_target(args)
     gw = GatewaySession(gui, session_id, authority, secret)
     log(f"GUI: {gui}  session: {session_id}")
 
@@ -896,12 +1043,20 @@ def main() -> int:
                      mic_device=args.mic_device, spk_device=args.spk_device,
                      utterance_max=args.utterance_max)
     cv.start()
+    follower = None
+    if args.session is None:
+        follower = SessionFollower(sdir, cv)
+        follower.start()
+        log(f"auto-follow on: newest session of {sdir.name} "
+            "(re-resolved as windows change; --session pins)")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
+        if follower is not None:
+            follower.stop()
         cv.stop()
     return 0
 

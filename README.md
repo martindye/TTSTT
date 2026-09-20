@@ -133,6 +133,16 @@ work to the coding agent").
   sentence by sentence. Thinking and tool activity are never spoken. Half
   duplex: the mic is closed from the user's utterance until the reply's audio
   has drained (released on `turn/end`).
+  - **Auto-follow (any window).** Unless pinned with `--session`, the bridge
+    re-resolves the *newest-written* session of the target workspace every
+    few seconds (debounced over two polls, never mid-turn), so it follows
+    whichever chat window the user is talking to: a newly opened window is
+    picked up as soon as it exists, an active reply keeps its window newest
+    while the agent works, and a quiet window is picked up once anything
+    lands in it. A switch reopens the follow stream within ~1 s; per-session
+    watermarks are re-armed from the new session's first snapshot and
+    leftover frames of the old session are dropped by session-id checks, so
+    a switch never double-speaks or crosses streams.
 
 ## Latency & thinking
 
