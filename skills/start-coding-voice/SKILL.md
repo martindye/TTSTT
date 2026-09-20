@@ -22,7 +22,7 @@ coding agent in the currently open chat window.
     python -X utf8 -m voice_stack.coding_voice --list-voices
 
 If the user wants a different voice, add `--tts-voice <name>` to the start
-command (below) for that run. `eve` is the default.
+command (below) for that run. `anna` is the default.
 
 ## Check status first
 
@@ -57,8 +57,11 @@ first.
    `C:\Users\press\.dsh\logs\coding_voice.log` and tell the user to speak.
 
 Useful options (append to the command):
+- `--workspace <path>` — point the voice at another DSH workspace's newest
+  session (e.g. `C:\Users\press\OneDrive\Projects\DSH_TESTS`). Default is
+  the TTSTT workspace (this coding chat).
 - `--session <id>` — target a specific session id. Default: the most recently
-  written TTSTT session (the chat the user is looking at).
+  written session of the target workspace.
 - `--tts-voice <name>` — voice; default `anna`. Run `--list-voices` for the
   full list (anna, vera, fantine, eponine, azelma, mary, jane, eve,
   cosette, caro_davy, alba, jean, charles, paul, george, michael, marius,
@@ -66,6 +69,29 @@ Useful options (append to the command):
 - `--utterance-max <seconds>` — how long the user may keep talking before
   their utterance is sent anyway (default 120 = two minutes).
 - `--gui <url>` — default `http://127.0.0.1:3080`.
+
+## Targeting another workspace ("start coding voice in <workspace>")
+
+The bridge speaks into ONE session, chosen at start. To aim it at a different
+workspace (e.g. "start coding voice in dsh tests"):
+
+1. Resolve the workspace directory: try
+   `C:\Users\press\OneDrive\Projects\<name>` (case-insensitive match). If it
+   is not there, look for the folder under `C:\Users\press\OneDrive\Projects`
+   and tell the user if none matches.
+2. Verify it has DSH sessions:
+   `Test-Path C:\Users\press\.dsh\sessions\--<workspace path with non-alphanumerics... >`
+   — simpler: just start the bridge with `--workspace <path>`; if there are
+   no sessions it exits with a clear error.
+3. Stop any running bridge, then start it with the extra flag:
+
+       python -X utf8 -m voice_stack.coding_voice --workspace C:\Users\press\OneDrive\Projects\DSH_TESTS
+
+   (workdir and logging as usual). Confirm `target session: session-...` in
+   the log, then `ready`.
+
+To go back to this coding chat: stop the bridge and start it without
+`--workspace` (the default is the TTSTT workspace).
 
 ## Stop
 
@@ -83,19 +109,20 @@ Confirm the process is gone, then report.
 - Spoken = the coding agent's visible text in that chat window, sentence by
   sentence. Thinking blocks and tool activity are never spoken.
 - While the bridge is speaking it does not listen at all (mic frames are
-  dropped, not even sent to STT), and the mic stays closed until the reply
-  audio has fully drained — so it never transcribes its own voice.
+  dropped before anything else happens — even while the agent is mid-turn —
+  so its own voice can never be buffered or transcribed).
 - While the coding agent is mid-turn (thinking/working) the bridge keeps
   the GPU 100% free for the agent: the STT model is OFF (zero GPU), TTS is
-  off, the agent's reply text is buffered, and if the user speaks a canned
-  "still working, one moment" is said. Anything the user says while the
-  agent works is captured to a mailbox (last 5 minutes of mic audio) and
-  transcribed the moment the turn ends, so nothing is lost. When the turn
-  ends the buffered reply is spoken.
-- Utterance ending is lenient: a short complete utterance (ends in . ! ? and
-  is ~14 words or fewer) sends after ~0.6-1.2 s; anything longer or
-  unpunctuated keeps the door open for pauses up to `--utterance-max`
-  (default 2 minutes) before being sent anyway.
+  off, and the agent's reply text is buffered until the turn ends. Anything
+  the user says while the agent works goes to a mailbox (ring buffer); when
+  the turn ends the most recent 60 s of it is transcribed and sent, so
+  nothing recent is lost without replaying minutes of old audio.
+- Utterance ending is lenient: a short utterance that ends in . ! ? sends
+  after ~0.6 s; an unpunctuated short utterance (3-12 words, a command)
+  sends only after 6 s of real silence; fragments shorter than 3 words are
+  never sent on their own — they merge with whatever the user says next.
+  Everything else holds the door open until `--utterance-max`
+  (default 2 minutes).
 - The bridge also speaks replies triggered any other way (typed in the GUI,
   handoffs) — everything the window shows is spoken. That is by design.
 - Logs: `C:\Users\press\.dsh\logs\coding_voice.log`. Session events are only

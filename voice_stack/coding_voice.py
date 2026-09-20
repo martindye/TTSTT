@@ -11,7 +11,11 @@ the mic.
 
 Run:
     python -X utf8 -m voice_stack.coding_voice [--gui http://127.0.0.1:3080]
-        [--session SESSION_ID] [--gui-home C:\\Users\\press\\.dsh]
+        [--session SESSION_ID] [--workspace C:\\...\\SomeWorkspace]
+        [--gui-home C:\\Users\\press\\.dsh]
+
+--workspace points the voice at another DSH workspace's newest session
+(default: the TTSTT workspace, i.e. this coding chat).
 """
 
 from __future__ import annotations
@@ -62,6 +66,11 @@ SENTENCE_END_PUNCT = {".", "!", "?", "\u2026", "\u3002", "\uff01", "\uff1f"}
 
 # Half-duplex: ignore the mic this long after our own audio stops.
 VOICE_TAIL_S = 1.0
+
+# At turn end only this much of the mailbox is transcribed (the rest is
+# stale by then). The ring itself still holds 5 min.
+MAX_MAIL_DRAIN_S = 60.0
+FRAME_S = 0.08
 
 # Cycle the follow stream this often (server idle-closes at ~75 s).
 STREAM_CYCLE_S = 50.0
@@ -373,21 +382,27 @@ class CodingVoice:
 
     # --------------------------------------------------------------- mic in
     def _speaking(self) -> bool:
-        """True while the bridge's own voice is (or is about to be) in the
-        air. The mic must not listen then — that is exactly the echo that
-        used to be transcribed and re-injected as 'user speech'."""
-        return self.spoken.busy_audio or self.speakers.pending_seconds > 0.05
+        """True while our own audio is actually in the air (speaker queue
+        non-empty, or still queued). Buffered-but-unsent reply text does
+        NOT count: it is not in the room yet, so the user's speech must
+        still reach the mailbox."""
+        return (self.speakers.pending_seconds > 0.05
+                or time.time() < self._audio_end_at)
 
     # --------------------------------------------------------------- mic in
     def _on_mic_block(self, pcm):
+        # 1) Our own audio in the air (reply drain, canned lines): drop.
+        #    Checked BEFORE the mailbox, because that audio must never be
+        #    buffered — it would be transcribed at turn end and injected
+        #    back as 'user speech' (the self-echo loop).
+        if self._speaking():
+            return
         if self._busy:
             # Keep the GPU 100% free for the agent's thinking: no STT feed,
-            # hold the audio (5 min ring) and transcribe it when the turn
-            # ends, so nothing the user said is lost.
+            # hold the user's audio (ring buffer) and transcribe it when the
+            # turn ends, so nothing they said is lost.
             self._mailbox.append(pcm)
             return
-        if self._speaking():
-            return  # our own voice: never transcribe it
         if self._stt_queue.full():
             try:
                 self._stt_queue.get_nowait()
@@ -399,10 +414,17 @@ class CodingVoice:
             pass
 
     def _drain_mailbox(self) -> None:
-        """Feed the buffered (busy-period) mic audio into the STT queue."""
+        """Feed the buffered (busy-period) mic audio into the STT queue.
+        Only the most recent MAX_MAIL_DRAIN_S is transcribed: by the time a
+        long turn is over, older buffered audio is stale, and replaying
+        minutes of it is what made the bridge feel like a loop."""
         n = len(self._mailbox)
         if not n:
             return
+        keep = int(MAX_MAIL_DRAIN_S / FRAME_S)
+        if n > keep:
+            del self._mailbox[: n - keep]
+            n = keep
         for pcm in self._mailbox:
             if self._stt_queue.full():
                 try:
@@ -697,13 +719,51 @@ class CodingVoice:
         self.speakers.close()
 
 
+def _project_key(cwd: str) -> str:
+    """DSH's projectKey (session-persistence-jsonl format.ts), verbatim:
+    filesystem/drive separators collapse to '-', [A-Za-z0-9._-] are kept,
+    every other character (including '~') becomes ~XXXX hex, leading
+    hyphens are stripped, and the slug is capped at 251 chars."""
+    readable = []
+    sep_run = False
+    for ch in cwd:
+        if ch in "/\\:":
+            if not sep_run:
+                readable.append("-")
+            sep_run = True
+        elif ch != "~" and (ch.isascii() and ch.isalnum() or ch in "._-"):
+            readable.append(ch)
+            sep_run = False
+        else:
+            readable.append("~%04X" % ord(ch))
+            sep_run = False
+    slug = "".join(readable).lstrip("-") or "root"
+    return "--" + slug[:251] + "--"
+
+
+def _workspace_sessions_dir(gui_home: str, workspace: str) -> Path | None:
+    """Sessions dir for an arbitrary workspace root, under gui_home."""
+    base = Path(gui_home) / "sessions"
+    cand = base / _project_key(os.path.normpath(workspace))
+    return cand if cand.is_dir() else None
+
+
 def _pick_session(args) -> str:
-    sdir = sessions_dir_for(Path(args.gui_home))
-    if sdir is None:
-        raise SystemExit(f"no sessions dir under {args.gui_home}; pass --session")
+    if args.workspace:
+        sdir = _workspace_sessions_dir(args.gui_home,
+                                       os.path.normpath(args.workspace))
+        if sdir is None:
+            raise SystemExit(
+                f"no sessions found for workspace {args.workspace!r} under "
+                f"{args.gui_home}/sessions; check the path (or use --session)")
+    else:
+        sdir = sessions_dir_for(Path(args.gui_home))
+        if sdir is None:
+            raise SystemExit(f"no sessions dir under {args.gui_home}; "
+                             "pass --session or --workspace")
     hit = find_target_session(sdir, args.session)
     if hit is None:
-        raise SystemExit("no TTSTT sessions found under the GUI home; pass --session")
+        raise SystemExit("no sessions found for that workspace; pass --session")
     log(f"target session: {hit}")
     return hit
 
@@ -714,7 +774,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Coding Voice: speak into the coding chat")
     ap.add_argument("--gui", default="http://127.0.0.1:3080")
     ap.add_argument("--session", default=None,
-                    help="session id (default: newest TTSTT session)")
+                    help="session id (default: newest session of the target "
+                         "workspace)")
+    ap.add_argument("--workspace", default=None,
+                    help="workspace root whose newest session is the target "
+                         "(default: the TTSTT workspace)")
     ap.add_argument("--gui-home", default=r"C:\Users\press\.dsh")
     ap.add_argument("--tts-voice", default="anna")
     ap.add_argument("--tts-language", default="english")
