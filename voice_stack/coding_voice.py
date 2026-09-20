@@ -358,8 +358,11 @@ class CodingVoice:
         self._audio_end_at = time.time() + self.speakers.pending_seconds
 
     def _audible(self) -> bool:
-        if self._floor.is_set():
-            return True
+        # Echo guard only: drop words while MY voice is (just was) in the
+        # air. Do NOT gate on the floor — the user may still be talking
+        # right after one of their sentences was sent, and that speech is
+        # legitimate input, not echo. (The mic-level _speaking() drop is
+        # the primary echo defence; this tail catches stragglers.)
         return time.time() < self._audio_end_at + VOICE_TAIL_S
 
     # --------------------------------------------------------------- mic in
