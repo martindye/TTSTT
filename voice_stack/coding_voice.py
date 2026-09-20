@@ -272,6 +272,13 @@ class CodingVoice:
         self._stop = threading.Event()
         self._cancel = threading.Event()
         self._audio_end_at = 0.0
+        # Snapshot-replay watermarks (session-global seq space, never reset):
+        # messages handled live are remembered by seq so a 50 s cycle never
+        # re-speaks them; in-flight chunk rows are fed only once, by seq.
+        self._seen_msg_seqs: set[int] = set()
+        self._msg_seq = 0
+        self._chunk_seq = 0
+        self._primed = False
         self.spoken = SpokenTurn(tts, self.speakers, self._note_audio, self._cancel)
         self._stt_queue: queue.Queue = queue.Queue(maxsize=240)
         self._pieces: list[str] = []
@@ -378,56 +385,100 @@ class CodingVoice:
             if isinstance(chunk, dict):
                 self._last_chunk_at = time.time()
                 self.spoken.feed(chunk)
+            seq = ev.get("seq") or 0
+            if isinstance(seq, int) and seq > self._chunk_seq:
+                self._chunk_seq = seq
+        elif t == "assistant/message":
+            # Remember messages fully streamed live so snapshot cycles never
+            # speak them again.
+            seq = ev.get("seq")
+            if isinstance(seq, int):
+                self._seen_msg_seqs.add(seq)
         elif t == "turn/end":
             self._turn_done.set()
 
     def _on_snapshot(self, snap: dict) -> None:
-        """Replay whatever the live stream missed while we were away."""
+        """Replay what the live stream missed — and only that.
+
+        Every record carries a session-global seq; watermarks make replay
+        idempotent across the 50 s stream cycles, so nothing is ever spoken
+        twice.
+        """
         records = snap.get("records") or []
-        latest_msg = None
-        for rec in reversed(records):
+        last_msg = None
+        max_seq = 0
+        for rec in records:
             if rec.get("type") != "event":
                 continue
             ev = rec.get("event") or {}
-            if ev.get("type") == "assistant/message":
-                latest_msg = ev
-                break
-            if ev.get("type") == "turn/end":
-                # Nothing after this turn is newer; stop looking back.
-                break
-        now_ms = self._inject_at_ms
-        if latest_msg is not None:
-            ts = latest_msg.get("time") or 0
-            # Only speak messages from the current (or later) turn.
-            if not now_ms or ts >= now_ms - 5000:
-                msg = (latest_msg.get("data") or {}).get("message") or {}
-                content = msg.get("content") or []
-                text = "".join(b.get("text", "") for b in content
-                               if isinstance(b, dict) and b.get("type") == "text")
-                if text.strip():
-                    self.spoken.resume_with(text)
-        else:
-            # Turn still in progress: reconstruct the in-flight text from the
-            # packed chunk rows / chunk events in the snapshot window.
-            for rec in records:
-                if rec.get("type") == "event":
-                    ev = rec.get("event") or {}
-                    if ev.get("type") == "assistant/chunk":
+            seq = ev.get("seq") or 0
+            if isinstance(seq, int):
+                max_seq = max(max_seq, seq)
+                if ev.get("type") == "assistant/message":
+                    last_msg = ev
+
+        if not self._primed:
+            # First snapshot: remember where history ends, speak nothing.
+            self._primed = True
+            if last_msg is not None:
+                self._msg_seq = last_msg.get("seq") or 0
+                self._seen_msg_seqs.add(self._msg_seq)
+            self._chunk_seq = max(self._chunk_seq, max_seq)
+            return
+
+        # A message that committed while we were away: speak it once.
+        # resume_with() additionally word-dedupes against what we already
+        # said (covers messages streamed live before the event was seen).
+        if last_msg is not None:
+            seq = last_msg.get("seq") or 0
+            self._msg_seq = max(self._msg_seq, seq)
+            if seq not in self._seen_msg_seqs:
+                self._seen_msg_seqs.add(seq)
+                if len(self._seen_msg_seqs) > 1000:
+                    self._seen_msg_seqs = set(list(self._seen_msg_seqs)[-200:])
+                ts = last_msg.get("time") or 0
+                now_ms = self._inject_at_ms
+                if not now_ms or ts >= now_ms - 5000:
+                    msg = (last_msg.get("data") or {}).get("message") or {}
+                    content = msg.get("content") or []
+                    text = "".join(b.get("text", "") for b in content
+                                   if isinstance(b, dict)
+                                   and b.get("type") == "text")
+                    if text.strip():
+                        self.spoken.resume_with(text)
+
+        # Turn still in progress: feed in-flight text rows we have not
+        # consumed yet (by seq), so cycles can't double-speak.
+        fed = 0
+        for rec in records:
+            if rec.get("type") == "event":
+                ev = rec.get("event") or {}
+                if ev.get("type") == "assistant/chunk":
+                    seq = ev.get("seq") or 0
+                    if seq > self._chunk_seq:
+                        self._chunk_seq = seq
                         chunk = (ev.get("data") or {}).get("chunk")
                         if isinstance(chunk, dict):
                             self.spoken.feed(chunk)
-                elif rec.get("type") == "chunks":
-                    ev = rec.get("event") or {}
-                    et = ev.get("type") or ""
+                            fed += 1
+            elif rec.get("type") == "chunks":
+                ev = rec.get("event") or {}
+                et = ev.get("type") or ""
+                seq = ev.get("seq") or 0
+                if et == "chunkrow/text-chunks" and seq > self._chunk_seq:
+                    self._chunk_seq = seq
                     data = ev.get("data") or {}
-                    if et == "chunkrow/text-chunks" and isinstance(data, dict):
+                    if isinstance(data, dict):
                         idx = data.get("index", 0)
                         self.spoken.block_type.setdefault(idx, "text")
                         for part in data.get("texts") or []:
                             if part:
                                 self.spoken.buf += part
                         self.spoken._pump()
-                    # reasoning/tool rows: deliberately skipped (never spoken)
+                        fed += 1
+            # reasoning/tool rows: deliberately skipped (never spoken)
+        if fed:
+            log(f"snapshot replay: {fed} chunk(s)")
 
     # ----------------------------------------------------------- floor loop
     def _floor_loop(self) -> None:
