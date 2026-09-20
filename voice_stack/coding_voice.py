@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import queue
+from collections import deque
 import re
 import sys
 import threading
@@ -327,10 +328,14 @@ class CodingVoice:
         self._inject_at_ms = 0
         # Endpointing: when the current utterance started + keep-open state.
         self._utterance_start = 0.0
-        # Agent-busy: while a turn of THIS session is running, speech output
-        # is buffered (no TTS, no CPU) and flushed when the turn ends.
+        # Agent-busy: while a turn of THIS session is running, the STT model
+        # is OFF (zero GPU for the agent's thinking), TTS is off, and the mic
+        # goes to a bounded mailbox that is transcribed right after the turn.
         self._busy = False
         self._busy_notified = False
+        self._mailbox: deque = deque(maxlen=3750)  # 5 min of 80 ms frames
+        self._mail_left = 0  # queued frames still to transcribe as mailbox
+        self._mail_skip = 0  # stale (pre-busy) frames ahead of the mailbox
 
     # ------------------------------------------------------------ echo guard
     def _note_audio(self) -> None:
@@ -343,6 +348,12 @@ class CodingVoice:
 
     # --------------------------------------------------------------- mic in
     def _on_mic_block(self, pcm):
+        if self._busy:
+            # Keep the GPU 100% free for the agent's thinking: no STT feed,
+            # hold the audio (5 min ring) and transcribe it when the turn
+            # ends, so nothing the user said is lost.
+            self._mailbox.append(pcm)
+            return
         if self._stt_queue.full():
             try:
                 self._stt_queue.get_nowait()
@@ -352,6 +363,26 @@ class CodingVoice:
             self._stt_queue.put_nowait(pcm)
         except queue.Full:
             pass
+
+    def _drain_mailbox(self) -> None:
+        """Feed the buffered (busy-period) mic audio into the STT queue."""
+        n = len(self._mailbox)
+        if not n:
+            return
+        for pcm in self._mailbox:
+            if self._stt_queue.full():
+                try:
+                    self._stt_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                self._stt_queue.put_nowait(pcm)
+            except queue.Full:
+                break
+        self._mailbox.clear()
+        self._mail_skip = self._stt_queue.qsize()  # stale frames first
+        self._mail_left = n
+        log(f"mailbox: transcribing {n * 0.08:.0f}s of buffered speech")
 
     def _stt_loop(self):
         import torch
@@ -363,6 +394,12 @@ class CodingVoice:
                 continue
             if self._stop.is_set():
                 break
+            is_mail = False
+            if self._mail_skip > 0:
+                self._mail_skip -= 1
+            elif self._mail_left > 0:
+                self._mail_left -= 1
+                is_mail = True
             try:
                 events = self.stt.feed_frame(torch.from_numpy(pcm))
             except Exception as e:
@@ -370,14 +407,16 @@ class CodingVoice:
                 continue
             for ev in events:
                 if ev.kind is SttEventKind.WORD:
-                    self._on_word(ev.piece)
+                    self._on_word(ev.piece, mail=is_mail)
             # END / SILENCE deliberately ignored (word-gap endpointing).
 
     # ------------------------------------------------------------- words
-    def _on_word(self, piece: str) -> None:
+    def _on_word(self, piece: str, mail: bool = False) -> None:
         if not piece.strip():
             return
-        if self._audible():
+        # Mailbox words were captured while the reply was not playing, so
+        # they bypass the echo gate; live words are still gated.
+        if self._audible() and not mail:
             return
         if not self._pieces:
             self._utterance_start = time.time()
@@ -455,9 +494,11 @@ class CodingVoice:
         if busy:
             self._busy_notified = False
             self.spoken.set_paused(True)
-            log("agent busy — pausing speech (buffering its reply)")
+            log("agent busy — STT off (GPU free), mic to mailbox, "
+                "reply buffered")
         else:
             self.spoken.set_paused(False)
+            self._drain_mailbox()
             log("agent done — speaking buffered reply")
 
     def _on_event(self, ev: dict) -> None:

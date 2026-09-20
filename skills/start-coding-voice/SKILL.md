@@ -82,10 +82,13 @@ Confirm the process is gone, then report.
   closed; the user speaks again after the reply is done.
 - Spoken = the coding agent's visible text in that chat window, sentence by
   sentence. Thinking blocks and tool activity are never spoken.
-- While the coding agent is mid-turn (thinking/working), the bridge goes
-  quiet: its reply text is buffered, no TTS runs (no competition for the
-  shared GPU/CPU), and if the user speaks a canned "still working, one
-  moment" is said. When the turn ends the buffered reply is spoken.
+- While the coding agent is mid-turn (thinking/working) the bridge keeps
+  the GPU 100% free for the agent: the STT model is OFF (zero GPU), TTS is
+  off, the agent's reply text is buffered, and if the user speaks a canned
+  "still working, one moment" is said. Anything the user says while the
+  agent works is captured to a mailbox (last 5 minutes of mic audio) and
+  transcribed the moment the turn ends, so nothing is lost. When the turn
+  ends the buffered reply is spoken.
 - Utterance ending is lenient: a short complete utterance (ends in . ! ? and
   is ~14 words or fewer) sends after ~0.6-1.2 s; anything longer or
   unpunctuated keeps the door open for pauses up to `--utterance-max`
