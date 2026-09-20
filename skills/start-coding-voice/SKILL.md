@@ -24,47 +24,59 @@ coding agent in the currently open chat window.
 If the user wants a different voice, add `--tts-voice <name>` to the start
 command (below) for that run. `anna` is the default.
 
-## Check status first
+## Start (fast path: at most 3 commands, well under a minute)
 
-    Get-Content C:\Users\press\.dsh\logs\coding_voice.log -Tail 5 -ErrorAction SilentlyContinue
+Target = the DSH workspace of the chat that asked for the voice = the
+agent's own working directory (TTSTT only when this chat IS the TTSTT
+project). Pass it as `--workspace <that dir>` — the bridge's built-in
+default (TTSTT) is wrong for every other chat, and a voice aimed at the
+wrong workspace is the classic "it took 20 minutes" failure.
 
-It is running if the last line is recent and recent lines show no repeated
-`follow stream error`. `coding-voice: ready — speaking into session ...`
-marks a successful boot. An old/absent log = not running (the supervisor
-re-truncates the log on each start, so its tail is always the live run).
-Never start a second instance (two processes would fight over the
-microphone) — stop the old one first.
+1. One-shot check — running, and aimed at the right workspace? The
+   sessions dir for a workspace is its path with `:` removed and every
+   other non-alphanumeric replaced by `-`, wrapped in `--` (DSH_TESTS →
+   `--C-Users-press-OneDrive-Projects-DSH_TESTS--`); each session is a
+   subdirectory named `session-...`. Run (substitute `$ws`):
 
-## Start
+       $ws = '--C-Users-press-OneDrive-Projects-DSH_TESTS--'   # per workspace
+       $lf = 'C:\Users\press\.dsh\logs\coding_voice.log'
+       if (Test-Path $lf) {
+         # whole file (it is small; the supervisor re-truncates it each start)
+         $m = [regex]::Match((Get-Content $lf) -join "`n", 'target session: (session-[0-9a-f-]+)')
+         $t = if ($m.Success) { $m.Groups[1].Value } else { '' }
+         'fresh=' + ((Get-Item $lf).LastWriteTime -gt (Get-Date).AddMinutes(-15)) +
+         ' target=' + $t + ' right=' + ($t -ne '' -and (Test-Path "C:\Users\press\.dsh\sessions\$ws\$t"))
+       } else { 'not running' }
 
-1. Prerequisite — the DSH GUI gateway must be up (it serves the chat window
-   the user is looking at):
-
-       Invoke-WebRequest http://127.0.0.1:3080/ -UseBasicParsing
-
-   (A 401 is fine — it means the gateway is up and wants a cookie.)
-   If it fails, tell the user the DSH web app must be open first and stop here.
-
-2. Make sure the log dir exists, then start the bridge via its supervisor
-   as a background pwsh job (workdir `C:\Users\press\OneDrive\Projects\TTSTT`,
-   `run_in_background: true`). The supervisor restarts the bridge if it dies,
-   and keeps the dead run's log as `coding_voice.prev.log` (crash forensics).
-   The log lives OUTSIDE the OneDrive-synced project dir on purpose. Extra
-   options go after the script name (e.g. `--tts-voice anna`):
+   - `fresh=True right=True` → already live and aimed here: tell the user,
+     do nothing else. STOP HERE.
+   - `right=False` or not fresh → steps 2-3. This one-liner is the WHOLE
+     check — no session forensics (no mtime archaeology, no id listings).
+2. If it was running: Stop (below) first. Then start it as a background pwsh
+   job, workdir `C:\Users\press\OneDrive\Projects\TTSTT` (that is where the
+   CODE lives; `--workspace` is where the SESSION lives):
 
        New-Item -ItemType Directory -Force C:\Users\press\.dsh\logs | Out-Null
-       powershell -NoProfile -File voice_stack\supervise_coding_voice.ps1
+       powershell -NoProfile -File voice_stack\supervise_coding_voice.ps1 --workspace 'C:\Users\press\OneDrive\Projects\DSH_TESTS'
 
-3. Give it 30-40 seconds (STT ~10s, TTS ~5s, follow stream open), then confirm
-   `ready — speaking into session session-...` appears in
-   `C:\Users\press\.dsh\logs\coding_voice.log` and tell the user to speak.
+   The supervisor restarts the bridge if it dies and keeps the dead run's
+   log as `coding_voice.prev.log`. The gateway must be up first:
+   `Invoke-WebRequest http://127.0.0.1:3080/ -UseBasicParsing` — a 401 is
+   fine (up, wants a cookie); a failure means the DSH web app is closed.
+3. Wait 30-40 s (STT ~10s, TTS ~5s, follow stream open), confirm
+   `ready — speaking into session ...` in `C:\Users\press\.dsh\logs\coding_voice.log`
+   (its session id must sit under the workspace's sessions dir from step 1)
+   and tell the user to speak.
 
 Useful options (append to the command):
-- `--workspace <path>` — point the voice at another DSH workspace's newest
-  session (e.g. `C:\Users\press\OneDrive\Projects\DSH_TESTS`). Default is
-  the TTSTT workspace (this coding chat).
-- `--session <id>` — target a specific session id. Default: the most recently
-  written session of the target workspace.
+- `--workspace <path>` — the DSH workspace whose newest session the voice
+  follows (e.g. `C:\Users\press\OneDrive\Projects\DSH_TESTS`). Pass it
+  whenever the requesting chat is not in the TTSTT workspace — which is
+  almost always, since the agent's working directory IS the workspace.
+  The built-in default (TTSTT) only fits this skill's own chat.
+- `--session <id>` — pin a specific session id. Default: the most recently
+  written session of the target workspace, and the bridge then AUTO-FOLLOWS
+  (see below) — passing `--session` disables auto-follow.
 - `--stt-model <fast|accurate>` — speech recognition model. `fast` (default)
   is kyutai/stt-1b-en_fr: quick, ~0.5 s delay. `accurate` is
   kyutai/stt-2.6b-en: noticeably more accurate but ~2.5 s delay, needs ~7 GB
@@ -80,28 +92,28 @@ Useful options (append to the command):
   their utterance is sent anyway (default 120 = two minutes).
 - `--gui <url>` — default `http://127.0.0.1:3080`.
 
-## Targeting another workspace ("start coding voice in <workspace>")
+## Auto-follow (any window in the target workspace)
 
-The bridge speaks into ONE session, chosen at start. To aim it at a different
-workspace (e.g. "start coding voice in dsh tests"):
+Unless pinned with `--session`, the bridge keeps re-resolving the
+**newest-written** session of the target workspace (a session's file mtime
+moves when it receives activity), debounced over two polls and never
+mid-turn. In practice: the user opens a new window -> the bridge follows it
+within a few seconds; an agent's active reply keeps its window newest while
+it works; a quiet window is picked up the moment anything lands in it.
+Switches log `auto-follow: speaking into session-...` in the log. Limitation:
+a window that is merely looked at (nothing has landed in it yet) is only
+picked up once something lands in it — a true focus signal would need a
+browser-side heartbeat, which the DSH gateway does not expose.
 
-1. Resolve the workspace directory: try
-   `C:\Users\press\OneDrive\Projects\<name>` (case-insensitive match). If it
-   is not there, look for the folder under `C:\Users\press\OneDrive\Projects`
-   and tell the user if none matches.
-2. Verify it has DSH sessions:
-   `Test-Path C:\Users\press\.dsh\sessions\--<workspace path with non-alphanumerics... >`
-   — simpler: just start the bridge with `--workspace <path>`; if there are
-   no sessions it exits with a clear error.
-3. Stop any running bridge, then start it with the extra flag:
+## "Start coding voice in <workspace>"
 
-       python -X utf8 -m voice_stack.coding_voice --workspace C:\Users\press\OneDrive\Projects\DSH_TESTS
-
-   (workdir and logging as usual). Confirm `target session: session-...` in
-   the log, then `ready`.
-
-To go back to this coding chat: stop the bridge and start it without
-`--workspace` (the default is the TTSTT workspace).
+Same fast path with a different `--workspace`: resolve the name under
+`C:\Users\press\OneDrive\Projects\<name>` (case-insensitive; if nothing
+matches, look under `C:\Users\press\OneDrive\Projects` and say so), use its
+sessions-dir name in the step-1 check, and pass the path to `--workspace`.
+Stop any running bridge first. The bridge follows ONE workspace at a time
+(auto-following between its sessions), so there is no "go back" — the next
+`/start-coding-voice` from any chat just re-aims it.
 
 ## Stop
 
