@@ -82,6 +82,9 @@ Confirm the process is gone, then report.
   closed; the user speaks again after the reply is done.
 - Spoken = the coding agent's visible text in that chat window, sentence by
   sentence. Thinking blocks and tool activity are never spoken.
+- While the bridge is speaking it does not listen at all (mic frames are
+  dropped, not even sent to STT), and the mic stays closed until the reply
+  audio has fully drained — so it never transcribes its own voice.
 - While the coding agent is mid-turn (thinking/working) the bridge keeps
   the GPU 100% free for the agent: the STT model is OFF (zero GPU), TTS is
   off, the agent's reply text is buffered, and if the user speaks a canned

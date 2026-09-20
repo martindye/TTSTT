@@ -97,6 +97,14 @@ class SpokenTurn:
         self.block_type: dict[int, str] = {}
         self._paused = False
         self._pending: list[str] = []
+        self._draining = False
+
+    @property
+    def busy_audio(self) -> bool:
+        """True while reply audio is still owed (buffered, draining, or in
+        the speaker queue). The mic must not be released while this holds,
+        otherwise the bridge hears and transcribes its own voice."""
+        return self._draining or bool(self._pending)
 
     def set_paused(self, paused: bool) -> None:
         """While paused (agent busy) sentences are buffered, not spoken; on
@@ -104,11 +112,19 @@ class SpokenTurn:
         loop is never blocked)."""
         self._paused = paused
         if not paused and self._pending:
+            self._draining = True
             threading.Thread(target=self._drain, daemon=True).start()
 
     def _drain(self) -> None:
-        while self._pending and not self.cancel.is_set():
-            self._speak(self._pending.pop(0))
+        try:
+            while self._pending and not self.cancel.is_set():
+                self._speak(self._pending.pop(0))
+            # Hold "busy" until the speakers are actually empty.
+            while not self.cancel.is_set() \
+                    and self.speakers.pending_seconds > 0.05:
+                time.sleep(0.1)
+        finally:
+            self._draining = False
 
     MAX_PENDING = 20  # ~2 min of speech; drop oldest beyond that
 
@@ -347,6 +363,13 @@ class CodingVoice:
         return time.time() < self._audio_end_at + VOICE_TAIL_S
 
     # --------------------------------------------------------------- mic in
+    def _speaking(self) -> bool:
+        """True while the bridge's own voice is (or is about to be) in the
+        air. The mic must not listen then — that is exactly the echo that
+        used to be transcribed and re-injected as 'user speech'."""
+        return self.spoken.busy_audio or self.speakers.pending_seconds > 0.05
+
+    # --------------------------------------------------------------- mic in
     def _on_mic_block(self, pcm):
         if self._busy:
             # Keep the GPU 100% free for the agent's thinking: no STT feed,
@@ -354,6 +377,8 @@ class CodingVoice:
             # ends, so nothing the user said is lost.
             self._mailbox.append(pcm)
             return
+        if self._speaking():
+            return  # our own voice: never transcribe it
         if self._stt_queue.full():
             try:
                 self._stt_queue.get_nowait()
@@ -612,10 +637,13 @@ class CodingVoice:
         while not self._stop.is_set():
             if self._floor.is_set():
                 now = time.time()
-                drained = self.speakers.pending_seconds <= 0.05
+                drained = (self.speakers.pending_seconds <= 0.05
+                           and not self.spoken.busy_audio)
                 if self._turn_done.is_set() and drained:
                     time.sleep(0.5)  # let final TTS flush
-                    if self.speakers.pending_seconds <= 0.05:
+                    drained = (self.speakers.pending_seconds <= 0.05
+                               and not self.spoken.busy_audio)
+                    if drained:
                         log("floor: reply done, mic open")
                         self._floor.clear()
                 elif (drained
