@@ -330,7 +330,10 @@ class GatewaySession:
                         "endpoint": "session/follow",
                         "payload": {"args": {"request": {
                             "address": {"kind": "session", "sessionId": sid},
-                            "maxMessages": 1,
+                            # A wide window so a missed turn/end is visible in
+                            # the snapshot even with events after it (the
+                            # recovery scan in _on_snapshot needs the headroom).
+                            "maxMessages": 200,
                         }}},
                     }))
                     opened_at = time.time()
@@ -363,6 +366,9 @@ class GatewaySession:
                 if stop.is_set():
                     return
                 log(f"follow stream error: {type(e).__name__}: {e}; retry in {delay:.0f}s")
+                import traceback
+                for line in traceback.format_exc().strip().splitlines()[-6:]:
+                    log(f"    tb: {line}")
                 time.sleep(delay)
                 delay = min(delay * 2, 5.0)
             if stop.is_set():
@@ -419,6 +425,10 @@ class CodingVoice:
         # goes to a bounded mailbox that is transcribed right after the turn.
         self._busy = False
         self._busy_notified = False
+        # Seq (session-global) of the first chunk that armed _busy. A
+        # snapshot showing turn/end after that seq means we missed the live
+        # turn/end (stream gap) and must release — see _on_snapshot.
+        self._busy_since_seq = 0
         self._mailbox: deque = deque(maxlen=3750)  # 5 min of 80 ms frames
         self._mail_left = 0  # queued frames still to transcribe as mailbox
         self._mail_skip = 0  # stale (pre-busy) frames ahead of the mailbox
@@ -478,7 +488,9 @@ class CodingVoice:
             return
         keep = int(MAX_MAIL_DRAIN_S / FRAME_S)
         if n > keep:
-            del self._mailbox[: n - keep]
+            # deque has no slice del — pop the stale head one frame at a time.
+            for _ in range(n - keep):
+                self._mailbox.popleft()
             n = keep
         for pcm in self._mailbox:
             if self._stt_queue.full():
@@ -635,8 +647,14 @@ class CodingVoice:
             log("agent busy — STT off (GPU free), mic to mailbox, "
                 "reply buffered")
         else:
+            self._busy_since_seq = 0
             self.spoken.set_paused(False)
-            self._drain_mailbox()
+            # A drain failure must never leave the stream dead or the busy
+            # state stuck: log and continue, the mic hands back regardless.
+            try:
+                self._drain_mailbox()
+            except Exception as e:
+                log(f"mailbox drain failed: {type(e).__name__}: {e}")
             log("agent done — speaking buffered reply")
 
     def _on_event(self, ev: dict) -> None:
@@ -648,6 +666,8 @@ class CodingVoice:
             return
         t = ev.get("type")
         if t == "assistant/chunk":
+            if not self._busy:
+                self._busy_since_seq = ev.get("seq") or 0
             self._set_busy(True)
             chunk = (ev.get("data") or {}).get("chunk")
             if isinstance(chunk, dict):
@@ -704,6 +724,25 @@ class CodingVoice:
             self._chunk_seq = max_seq
             return
 
+        # Recovery: the live stream can gap (error, 50 s cycle, retarget)
+        # and drop the turn/end that releases the busy state. If this
+        # snapshot already contains a turn/end after the event that armed
+        # us, the turn is over — release now instead of waiting for a
+        # turn/end that will never come.
+        if self._busy and self._busy_since_seq:
+            for rec in records:
+                if rec.get("type") != "event":
+                    continue
+                ev = rec.get("event") or {}
+                if ev.get("type") != "turn/end":
+                    continue
+                s = ev.get("seq") or 0
+                if isinstance(s, int) and s > self._busy_since_seq:
+                    log("snapshot: missed turn/end — releasing (recovery)")
+                    self._turn_done.set()
+                    self._set_busy(False)
+                    break
+
         # A message that committed while we were away: speak it once.
         # resume_with() additionally word-dedupes against what we already
         # said (covers messages streamed live before the event was seen).
@@ -745,6 +784,8 @@ class CodingVoice:
                 seq = ev.get("seq") or 0
                 if et == "chunkrow/text-chunks" and seq > self._chunk_seq:
                     self._chunk_seq = seq
+                    if not self._busy:
+                        self._busy_since_seq = seq
                     self._set_busy(True)  # a turn is in flight
                     data = ev.get("data") or {}
                     if isinstance(data, dict):
