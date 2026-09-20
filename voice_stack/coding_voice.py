@@ -223,7 +223,14 @@ class GatewaySession:
     def __init__(self, gui_url: str, session_id: str, authority: str, secret: bytes):
         self.gui_url = gui_url.rstrip("/")
         self.session_id = session_id
-        self.cookie = mint_cookie(authority, secret)
+        self.authority = authority
+        self.secret = secret
+
+    def _cookie(self) -> str:
+        """A freshly signed cookie, minted per use. Cookies expire (2 h
+        lifetime) and this bridge runs for days — minting is a local HMAC,
+        so freshness is free and the gateway can never see a stale one."""
+        return mint_cookie(self.authority, self.secret)
 
     def inject(self, text: str) -> None:
         """Send a user utterance into the session (mode 'queue')."""
@@ -242,7 +249,7 @@ class GatewaySession:
         }
         resp = requests.post(
             self.gui_url + "/api/session/prompt",
-            headers={"Cookie": self.cookie},
+            headers={"Cookie": self._cookie()},
             json=body,
             timeout=15,
         )
@@ -266,7 +273,7 @@ class GatewaySession:
             try:
                 async with websockets.connect(
                     self.gui_url.replace("http://", "ws://") + "/api/remote.mux",
-                    additional_headers={"Cookie": self.cookie},
+                    additional_headers={"Cookie": self._cookie()},
                     max_size=200 * 1024 * 1024,
                     ping_interval=15,
                     ping_timeout=15,
