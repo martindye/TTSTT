@@ -50,9 +50,14 @@ from .handoff import (  # noqa: E402
 LOG_PREFIX = "coding-voice:"
 
 # Word-gap endpointing (same shape as voice_dsh): after the last STT word wait
-# this long before sending; sentence-final punctuation halves the wait.
+# this long before checking; sentence-final punctuation halves the wait.
 WORD_GAP_S = 1.2
 WORD_GAP_SENTENCE_S = 0.6
+# An unpunctuated fragment is only sent after this much continuous silence
+# (it may still be the lead-in to a longer utterance). Punctuated sentences
+# send immediately; long ones after LONG_FINAL_SILENCE_S of real silence.
+COMMAND_SILENCE_S = 6.0
+LONG_FINAL_SILENCE_S = 3.0
 SENTENCE_END_PUNCT = {".", "!", "?", "\u2026", "\u3002", "\uff01", "\uff1f"}
 
 # Half-duplex: ignore the mic this long after our own audio stops.
@@ -344,6 +349,7 @@ class CodingVoice:
         self._inject_at_ms = 0
         # Endpointing: when the current utterance started + keep-open state.
         self._utterance_start = 0.0
+        self._last_word_at = 0.0
         # Agent-busy: while a turn of THIS session is running, the STT model
         # is OFF (zero GPU for the agent's thinking), TTS is off, and the mic
         # goes to a bounded mailbox that is transcribed right after the turn.
@@ -450,6 +456,7 @@ class CodingVoice:
             self._utterance_start = time.time()
         self._pieces.append(piece)
         self._last_piece = piece
+        self._last_word_at = time.time()
         self._arm_timer()
 
     def _arm_timer(self) -> None:
@@ -475,15 +482,23 @@ class CodingVoice:
         words = len(text.split())
         last = (self._last_piece or "").lstrip("\u2581").strip()
         final = last in SENTENCE_END_PUNCT
+        silence = time.time() - self._last_word_at
         age = time.time() - self._utterance_start
         if final and words <= 14:
-            pass  # complete short utterance ("what's the weather?")
-        elif not final and words <= 8:
-            pass  # short command without punctuation ("fix the login bug")
+            pass  # complete short sentence ("what's the weather?")
+        elif final and silence >= LONG_FINAL_SILENCE_S:
+            pass  # long sentence that ended properly, and a real pause
+        elif (not final) and 3 <= words <= 12 and silence >= COMMAND_SILENCE_S:
+            # A short command the user has really stopped speaking
+            # ("fix the login bug"). No-punctuation fragments shorter than
+            # 3 words are never sent this way — they are lead-ins
+            # ("so, can ...") that belong to a longer utterance.
+            pass
         elif age >= self._utterance_max:
             log(f"utterance max ({self._utterance_max:.0f}s) reached, sending")
         else:
-            # Incomplete or long: hold the door open, recheck after the gap.
+            # Hold the door open: the user may just be pausing mid-sentence
+            # or mid-utterance. Recheck after the next gap.
             self._arm_timer()
             return
         self._do_send()
