@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Voice session home (private conversation data) + local model caches
+.dsh-voice/
+models/
+
+# Big/binary dev tools
+tools/
+
+# Logs and test artifacts
+pip_install*.log
+*.log
+tests/*.txt
+tests/*.wav
+tests/*.json
+tests/*.err

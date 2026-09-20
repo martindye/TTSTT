@@ -1,0 +1,17 @@
+# Python 3.12 (Windows/Linux). Verified 2026-09 on Windows + NVIDIA.
+#
+# Install torch with CUDA support FIRST, from the PyTorch index:
+#   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+# then the rest:
+#   pip install -r requirements.txt
+
+moshi==0.2.13          # Kyutai STT 1B (kyutai "moshi" package)
+pocket-tts==3.1.0      # Pocket TTS (~100M, CPU, streaming)
+sounddevice==0.5.0     # PortAudio mic/speaker I/O
+websockets==15.0.1     # coding-voice follow stream
+requests==2.32.3       # gateway injection
+PyYAML==6.0.2          # browser secret for the GUI gateway cookie
+python-dotenv==1.1.0
+numpy==2.2.6
+transformers==4.57.1   # pulled in by moshi; pinned for reproducibility
+# torch installed separately (see note above), e.g. torch==2.8.0+cu128
