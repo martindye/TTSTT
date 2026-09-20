@@ -698,7 +698,7 @@ def main() -> int:
     ap.add_argument("--session", default=None,
                     help="session id (default: newest TTSTT session)")
     ap.add_argument("--gui-home", default=r"C:\Users\press\.dsh")
-    ap.add_argument("--tts-voice", default="eve")
+    ap.add_argument("--tts-voice", default="anna")
     ap.add_argument("--tts-language", default="english")
     ap.add_argument("--tts-quantize", default="int4", choices=["int4", "none"])
     ap.add_argument("--stt-repo", default="kyutai/stt-1b-en_fr")

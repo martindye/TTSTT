@@ -59,7 +59,7 @@ first.
 Useful options (append to the command):
 - `--session <id>` — target a specific session id. Default: the most recently
   written TTSTT session (the chat the user is looking at).
-- `--tts-voice <name>` — voice; default `eve`. Run `--list-voices` for the
+- `--tts-voice <name>` — voice; default `anna`. Run `--list-voices` for the
   full list (anna, vera, fantine, eponine, azelma, mary, jane, eve,
   cosette, caro_davy, alba, jean, charles, paul, george, michael, marius,
   javert, bill_boerst, peter_yearsley, stuart_bell, ...).
