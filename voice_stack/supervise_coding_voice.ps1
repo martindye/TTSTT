@@ -33,12 +33,6 @@ if (-not $LogFile) {
     $LogFile = Join-Path (Join-Path $dshHome "logs") "coding_voice.log"
 }
 
-# Offline-first: every model this bridge uses (both Kyutai STT models, the
-# pocket-tts voices) is already in the local Hugging Face cache, and the
-# huggingface.co freshness HEAD-checks have a bad habit of hanging startup
-# on flaky DNS/network. Set to 0 to allow downloads (new model, first use).
-$env:HF_HUB_OFFLINE = "1"
-
 $logDir = Split-Path $LogFile -Parent
 $stopFlag = Join-Path $logDir "coding_voice.STOP"
 $supLog = Join-Path $logDir "coding_voice_supervisor.log"
@@ -52,6 +46,28 @@ function LogSup($msg) {
     $line = "{0} supervisor: {1}" -f (Get-Date -Format "HH:mm:ss"), $msg
     Add-Content -Path $supLog -Value $line -Encoding utf8
     Write-Output $line
+}
+
+# Offline-first when we can be: with every model this run needs in the local
+# Hugging Face cache, startup never touches huggingface.co (whose freshness
+# HEAD-checks hang on flaky DNS/network). On a fresh machine the cache is
+# empty, so allow downloads for that first run; every start after finds the
+# cache warm and goes offline automatically.
+$hubCache = Join-Path $env:USERPROFILE ".cache\huggingface\hub"
+$pyArgList = @($PyArgs | Where-Object { $_ })   # safe when $null
+$sttModel = "fast"
+for ($i = 0; $i -lt $pyArgList.Count - 1; $i++) {
+    if ($pyArgList[$i] -eq "--stt-model") { $sttModel = $pyArgList[$i + 1] }
+}
+$needStt = if ($sttModel -eq "accurate") { "models--kyutai--stt-2.6b-en" }
+           else { "models--kyutai--stt-1b-en-fr" }
+$cacheWarm = (Test-Path (Join-Path $hubCache $needStt)) -and
+             (Test-Path (Join-Path $hubCache "models--kyutai--pocket-tts-without-voice-cloning"))
+if ($cacheWarm) {
+    $env:HF_HUB_OFFLINE = "1"
+} else {
+    $env:HF_HUB_OFFLINE = "0"
+    LogSup "HF cache not warm ($needStt) - allowing model download this run"
 }
 
 function Write-State([int]$BridgePid) {
