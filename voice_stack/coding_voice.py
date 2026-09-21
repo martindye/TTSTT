@@ -1091,10 +1091,18 @@ def main() -> int:
         log(f"auto-follow on: newest session of {sdir.name} "
             "(re-resolved as windows change; --session pins)")
     try:
+        # Keep the log mtime fresh so an outside watcher (ensure_coding_voice)
+        # can tell a live-but-idle bridge from a dead one without asking the
+        # process itself: "log written within ~90 s" == alive.
+        last_hb = 0.0
         while True:
             time.sleep(1)
+            now = time.time()
+            if now - last_hb >= 30:
+                last_hb = now
+                log("heartbeat")
     except KeyboardInterrupt:
-        pass
+        log("KeyboardInterrupt - console ctrl-C/close event, exiting")
     finally:
         if follower is not None:
             follower.stop()
