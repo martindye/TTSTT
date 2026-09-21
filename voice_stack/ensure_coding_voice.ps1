@@ -28,8 +28,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$LogDir    = "C:\Users\press\.dsh\logs"
-$LogFile   = Join-Path $LogDir "coding_voice.log"
+# DSH home: $DSH_HOME or the default <user profile>\.dsh (portable across
+# machines — this whole package must work unmodified on a fresh clone).
+$DshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE ".dsh" }
+$LogDir  = Join-Path $DshHome "logs"
+$LogFile = Join-Path $LogDir "coding_voice.log"
 $ErrLog    = Join-Path $LogDir "coding_voice.err.log"
 $SupLog    = Join-Path $LogDir "coding_voice_supervisor.log"
 $StateFile = Join-Path $LogDir "coding_voice.state"
@@ -62,9 +65,26 @@ function Fail([string]$reason) {
     exit 1
 }
 
-$wsNorm = $Workspace.TrimEnd('\', '/').ToLower()
+# ------------------------------------------------------------- one package
+# First run on this machine: install this skill (with this machine's paths
+# rendered in) into the DSH home, so the package is complete after one run.
+# An existing skill file is left untouched (it may be customised).
+$RepoRoot = Split-Path $PSScriptRoot -Parent
+$SkillTpl = Join-Path $RepoRoot "skills\start-coding-voice\SKILL.md"
+$SkillDst = Join-Path $DshHome "skills\start-coding-voice\SKILL.md"
+if (Test-Path $SkillTpl) {
+    if (-not (Test-Path $SkillDst)) {
+        $skillText = (Get-Content $SkillTpl -Raw)
+        $skillText = $skillText.Replace("{{TTSTT_ROOT}}", $RepoRoot)
+        $skillText = $skillText.Replace("{{DASHOME}}", $DshHome)
+        New-Item -ItemType Directory -Path (Split-Path $SkillDst) -Force | Out-Null
+        Set-Content -Path $SkillDst -Value $skillText -Encoding UTF8
+        Say "skill installed: $SkillDst"
+    }
+}
 
 # ---------------------------------------------------------------- current
+$wsNorm = $Workspace.TrimEnd('\', '/').ToLower()
 $state = Read-State
 $bridgePid = 0; $supPid = 0; $stateWs = ""
 if ($state) {

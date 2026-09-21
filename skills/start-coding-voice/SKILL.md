@@ -10,7 +10,7 @@ The coding voice is a bridge process: microphone -> Kyutai STT (GPU) -> the
 **open coding chat** (injected through the GUI gateway, so the user's words
 appear in the chat window) -> the coding agent's visible replies are followed
 live and spoken with Pocket TTS (thinking and tool activity are never spoken).
-Project root: `C:\Users\press\OneDrive\Projects\TTSTT`.
+Project root: {{TTSTT_ROOT}}.
 
 This is different from the voice assistant (the `start-voice` skill): that one
 talks to a separate invisible voice agent; the coding voice talks to the
@@ -18,62 +18,39 @@ coding agent in the currently open chat window.
 
 ## List available voices (no bridge needed)
 
-    cd C:\Users\press\OneDrive\Projects\TTSTT
+    cd {{TTSTT_ROOT}}
     python -X utf8 -m voice_stack.coding_voice --list-voices
 
 If the user wants a different voice, add `--tts-voice <name>` to the start
 command (below) for that run. `anna` is the default.
 
-## Start (fast path: at most 3 commands, well under a minute)
+## Start — one command, idempotent (no thinking)
 
 Target = the DSH workspace of the chat that asked for the voice = the
-agent's own working directory (TTSTT only when this chat IS the TTSTT
-project). Pass it as `--workspace <that dir>` — the bridge's built-in
-default (TTSTT) is wrong for every other chat, and a voice aimed at the
-wrong workspace is the classic "it took 20 minutes" failure.
+agent's own working directory (the project root only when this chat IS the
+project's own chat). Run exactly this (substitute the workspace dir), from
+anywhere:
 
-1. One-shot check — running, and aimed at the right workspace? The
-   sessions dir for a workspace is its path with `:` removed and every
-   other non-alphanumeric replaced by `-`, wrapped in `--` (DSH_TESTS →
-   `--C-Users-press-OneDrive-Projects-DSH_TESTS--`); each session is a
-   subdirectory named `session-...`. Run (substitute `$ws`):
+    powershell -NoProfile -File {{TTSTT_ROOT}}\voice_stack\ensure_coding_voice.ps1 -Workspace '<the requesting chat's workspace>'
 
-       $ws = '--C-Users-press-OneDrive-Projects-DSH_TESTS--'   # per workspace
-       $lf = 'C:\Users\press\.dsh\logs\coding_voice.log'
-       if (Test-Path $lf) {
-         # whole file (it is small; the supervisor re-truncates it each start)
-         $m = [regex]::Match((Get-Content $lf) -join "`n", 'target session: (session-[0-9a-f-]+)')
-         $t = if ($m.Success) { $m.Groups[1].Value } else { '' }
-         'fresh=' + ((Get-Item $lf).LastWriteTime -gt (Get-Date).AddMinutes(-15)) +
-         ' target=' + $t + ' right=' + ($t -ne '' -and (Test-Path "C:\Users\press\.dsh\sessions\$ws\$t"))
-       } else { 'not running' }
+It handles EVERY starting state by itself — already running (reports it,
+changes nothing), stale/dead (stops it, starts fresh), aimed at the wrong
+workspace (re-aims), not running (starts). It also installs this skill into
+the DSH home on first use, so the package is complete after one run. It
+launches the supervisor detached (NOT as a chat background job, so the voice
+outlives this chat session), waits until the bridge is actually ready, and
+exits:
 
-   - `fresh=True right=True` → already live and aimed here: tell the user,
-     do nothing else. STOP HERE.
-   - `right=False` or not fresh → steps 2-3. This one-liner is the WHOLE
-     check — no session forensics (no mtime archaeology, no id listings).
-2. If it was running: Stop (below) first. Then start it as a background pwsh
-   job, workdir `C:\Users\press\OneDrive\Projects\TTSTT` (that is where the
-   CODE lives; `--workspace` is where the SESSION lives):
-
-       New-Item -ItemType Directory -Force C:\Users\press\.dsh\logs | Out-Null
-       powershell -NoProfile -File voice_stack\supervise_coding_voice.ps1 --workspace 'C:\Users\press\OneDrive\Projects\DSH_TESTS'
-
-   The supervisor restarts the bridge if it dies and keeps the dead run's
-   log as `coding_voice.prev.log`. The gateway must be up first:
-   `Invoke-WebRequest http://127.0.0.1:3080/ -UseBasicParsing` — a 401 is
-   fine (up, wants a cookie); a failure means the DSH web app is closed.
-3. Wait 30-40 s (STT ~10s, TTS ~5s, follow stream open), confirm
-   `ready — speaking into session ...` in `C:\Users\press\.dsh\logs\coding_voice.log`
-   (its session id must sit under the workspace's sessions dir from step 1)
-   and tell the user to speak.
+- exit 0 → the command printed which session it is speaking into. Tell the
+  user to speak. STOP HERE.
+- exit 1 → the reason and the relevant log tails are printed. Fix that one
+  thing, run the same command again. That is the only "thinking" allowed.
 
 Useful options (append to the command):
 - `--workspace <path>` — the DSH workspace whose newest session the voice
-  follows (e.g. `C:\Users\press\OneDrive\Projects\DSH_TESTS`). Pass it
-  whenever the requesting chat is not in the TTSTT workspace — which is
-  almost always, since the agent's working directory IS the workspace.
-  The built-in default (TTSTT) only fits this skill's own chat.
+  follows. Pass it whenever the requesting chat is not in the project's own
+  workspace — which is almost always, since the agent's working directory
+  IS the workspace.
 - `--session <id>` — pin a specific session id. Default: the most recently
   written session of the target workspace, and the bridge then AUTO-FOLLOWS
   (see below) — passing `--session` disables auto-follow.
@@ -107,34 +84,49 @@ browser-side heartbeat, which the DSH gateway does not expose.
 
 ## "Start coding voice in <workspace>"
 
-Same fast path with a different `--workspace`: resolve the name under
-`C:\Users\press\OneDrive\Projects\<name>` (case-insensitive; if nothing
-matches, look under `C:\Users\press\OneDrive\Projects` and say so), use its
-sessions-dir name in the step-1 check, and pass the path to `--workspace`.
-Stop any running bridge first. The bridge follows ONE workspace at a time
-(auto-following between its sessions), so there is no "go back" — the next
-`/start-coding-voice` from any chat just re-aims it.
+The same one command with a different `-Workspace`. Resolve the name against
+the user's projects folder (case-insensitive; if nothing matches, ask). No
+stopping first — the script re-aims any running bridge for you. The bridge
+follows ONE workspace at a time (auto-following between its sessions), so
+there is no "go back": the next `/start-coding-voice` from any chat just
+re-aims it again.
 
 ## Stop
 
 Create the stop sentinel FIRST (so the supervisor does not restart the
-bridge), then kill the python process:
+bridge), then kill the bridge by the PID the supervisor recorded in
+`coding_voice.state` (no WMI needed; only if that file is absent — a legacy
+stack — kill any `python`):
 
-    New-Item C:\Users\press\.dsh\logs\coding_voice.STOP -ItemType File -Force
-    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-      Where-Object { $_.CommandLine -like '*voice_stack.coding_voice*' } |
-      ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    New-Item {{DASHOME}}\logs\coding_voice.STOP -ItemType File -Force
+    $s = $null
+    if (Test-Path {{DASHOME}}\logs\coding_voice.state) {
+      $s = Get-Content {{DASHOME}}\logs\coding_voice.state -Raw | ConvertFrom-Json
+    }
+    if ($s) { Stop-Process -Id $s.bridge_pid -Force }
+    else { Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force }
 
 Then confirm `supervisor stopped` appears in
-`C:\Users\press\.dsh\logs\coding_voice_supervisor.log` (the supervisor
-removes the sentinel itself when it exits).
+{{DASHOME}}\logs\coding_voice_supervisor.log (the supervisor
+removes the sentinel and its state file itself when it exits).
 
 ## Notes
 
 - The supervisor auto-restarts the bridge on unexpected death; the dead
   run's log is kept as `coding_voice.prev.log` and supervisor actions are
-  in `coding_voice_supervisor.log`. If the voice is dead, check those two
-  files first.
+  in `coding_voice_supervisor.log` (both under {{DASHOME}}\logs). If the
+  voice is dead, check those two files first.
+- Liveness without forensics: the bridge writes a `heartbeat` log line every
+  30 s, and while running the supervisor writes `coding_voice.state`
+  (supervisor PID, bridge PID, workspace). "Alive" = state file present,
+  PIDs live, log mtime < 90 s. `ensure_coding_voice.ps1` does exactly that
+  check and nothing else before deciding to (re)start.
+- Models load OFFLINE: the supervisor sets `HF_HUB_OFFLINE=1`, so startup
+  never touches huggingface.co (both STT models and the TTS voices are in
+  the local HF cache). On a FRESH machine the cache is empty, so the first
+  start must be allowed to download: set `HF_HUB_OFFLINE` to 0 in
+  `supervise_coding_voice.ps1` once, let the models download, then set it
+  back to 1. A missing model is a clear local error, not a network timeout.
 - Half-duplex: while the bridge is holding the floor (from the user's
   utterance until the reply's audio has finished playing) the microphone is
   closed; the user speaks again after the reply is done.
@@ -157,5 +149,5 @@ removes the sentinel itself when it exits).
   (default 2 minutes).
 - The bridge also speaks replies triggered any other way (typed in the GUI,
   handoffs) — everything the window shows is spoken. That is by design.
-- Logs: `C:\Users\press\.dsh\logs\coding_voice.log`. Session events are only
+- Logs: {{DASHOME}}\logs\coding_voice.log. Session events are only
   consumed; the gateway is never restarted by this bridge.

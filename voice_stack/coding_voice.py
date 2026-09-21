@@ -12,7 +12,7 @@ the mic.
 Run:
     python -X utf8 -m voice_stack.coding_voice [--gui http://127.0.0.1:3080]
         [--session SESSION_ID] [--workspace C:\\...\\SomeWorkspace]
-        [--gui-home C:\\Users\\press\\.dsh]
+        [--gui-home DSH_HOME]
 
 --workspace points the voice at another DSH workspace's newest session
 (default: the TTSTT workspace, i.e. this coding chat).
@@ -114,7 +114,10 @@ FRAME_S = 0.08
 STREAM_CYCLE_S = 50.0
 # Floor (mic-closed) safety releases.
 FLOOR_IDLE_S = 2.5      # audio drained + no chunks for this long
-FLOOR_MAX_S = 45.0      # absolute cap
+FLOOR_MAX_S = 240.0     # absolute backstop; normal release is turn-end +
+                       # drained audio, so this only bites when the audio
+                       # pipeline is stuck. Long spoken replies (2-3 min)
+                       # must not be cut off mid-sentence.
 
 FLOOR_LOG_ONCE = True
 
@@ -612,11 +615,23 @@ class CodingVoice:
         if self._busy and not self._busy_notified:
             self._busy_notified = True
             self.spoken.speak_now("I'm still working on it. One moment.")
-        try:
-            self.gw.inject(text)
-        except Exception as e:
+        # The gateway occasionally rejects a valid cookie for a few seconds
+        # (transient 401s / dropped upgrades observed in the wild), so one
+        # failed delivery is retried before the utterance is declared lost.
+        err: Exception | None = None
+        for attempt in (0, 1, 2):
+            if attempt:
+                time.sleep(2.0 * attempt)
+                log(f"inject retry {attempt}: previous: {err!r}")
+            try:
+                self.gw.inject(text)
+                err = None
+                break
+            except Exception as e:  # noqa: BLE001
+                err = e
+        if err is not None:
             self._floor.clear()
-            log(f"inject failed: {e}")
+            log(f"inject failed after retries: {err}")
 
     # ---------------------------------------------------------- auto-follow
     def retarget(self, sid: str) -> bool:
@@ -1016,7 +1031,8 @@ def main() -> int:
     ap.add_argument("--workspace", default=None,
                     help="workspace root whose newest session is the target "
                          "(default: the TTSTT workspace)")
-    ap.add_argument("--gui-home", default=r"C:\Users\press\.dsh")
+    ap.add_argument("--gui-home", default=None,
+                    help="DSH home (default: $DSH_HOME or ~/.dsh)")
     ap.add_argument("--tts-voice", default="anna")
     ap.add_argument("--tts-language", default="english")
     ap.add_argument("--tts-quantize", default="int4", choices=["int4", "none"])
@@ -1039,6 +1055,9 @@ def main() -> int:
     ap.add_argument("--list-voices", action="store_true",
                     help="print the available TTS voices and exit")
     args = ap.parse_args()
+    if args.gui_home is None:
+        args.gui_home = str(Path(os.environ.get("DSH_HOME")
+                                 or (Path.home() / ".dsh")))
 
     if args.list_voices:
         try:

@@ -13,18 +13,25 @@
 #       powershell -NoProfile -File voice_stack\ensure_coding_voice.ps1 `
 #           -Workspace 'C:\path\to\DSH workspace'
 #   Stop:
-#       New-Item C:\Users\press\.dsh\logs\coding_voice.STOP -ItemType File -Force
+#       New-Item <DASHOME>\logs\coding_voice.STOP -ItemType File -Force
 #       <then Stop-Process the bridge_pid from coding_voice.state>
+#       (DASHOME = $DSH_HOME or ~/.dsh)
 #
 # Any extra arguments are passed straight to the bridge (e.g. --tts-voice).
 
 param(
-    [string]$LogFile = "C:\Users\press\.dsh\logs\coding_voice.log",
+    [string]$LogFile = "",
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$PyArgs
 )
 
 $ErrorActionPreference = "Continue"
+
+if (-not $LogFile) {
+    $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME }
+               else { Join-Path $env:USERPROFILE ".dsh" }
+    $LogFile = Join-Path (Join-Path $dshHome "logs") "coding_voice.log"
+}
 
 # Offline-first: every model this bridge uses (both Kyutai STT models, the
 # pocket-tts voices) is already in the local Hugging Face cache, and the
