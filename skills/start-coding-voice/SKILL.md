@@ -135,12 +135,13 @@ removes the sentinel and its state file itself when it exits).
 - While the bridge is speaking it does not listen at all (mic frames are
   dropped before anything else happens — even while the agent is mid-turn —
   so its own voice can never be buffered or transcribed).
-- While the coding agent is mid-turn (thinking/working) the bridge keeps
-  the GPU 100% free for the agent: the STT model is OFF (zero GPU), TTS is
-  off, and the agent's reply text is buffered until the turn ends. Anything
-  the user says while the agent works goes to a mailbox (ring buffer); when
-  the turn ends the most recent 60 s of it is transcribed and sent, so
-  nothing recent is lost without replaying minutes of old audio.
+- While the coding agent is mid-turn (thinking/working) the reply is
+  SPOKEN LIVE as it streams in, while the STT model stays OFF (GPU for the
+  agent). The mic is closed while reply audio is in the air (echo guard)
+  and open in the gaps (between sentences, tool calls); anything the user
+  says in a gap goes to a mailbox (ring buffer), and when the turn ends the
+  most recent 60 s of it is transcribed and sent, so nothing recent is lost
+  without replaying minutes of old audio.
 - Utterance ending is lenient: a short utterance that ends in . ! ? sends
   after ~0.6 s; an unpunctuated short utterance (3-12 words, a command)
   sends only after 6 s of real silence; fragments shorter than 3 words are

@@ -162,9 +162,10 @@ class SpokenTurn:
         return self._draining or bool(self._pending)
 
     def set_paused(self, paused: bool) -> None:
-        """While paused (agent busy) sentences are buffered, not spoken; on
-        un-pause the buffer is played back (in its own thread, so the event
-        loop is never blocked)."""
+        """While paused, sentences are buffered, not spoken; on un-pause the
+        buffer is played back (in its own thread, so the event loop is never
+        blocked). Agent turns no longer pause the pipeline (the reply is
+        spoken live), but the mechanism is kept for explicit pauses."""
         self._paused = paused
         if not paused and self._pending:
             self._draining = True
@@ -658,9 +659,15 @@ class CodingVoice:
         self._busy = busy
         if busy:
             self._busy_notified = False
-            self.spoken.set_paused(True)
+            # TTS keeps running LIVE during the turn: the user wants to hear
+            # the work happen as it happens (context matters), and the TTS
+            # model is small enough to coexist with the agent's LLM. STT
+            # stays OFF (GPU for the agent) and the mic feeds the mailbox,
+            # as before; while the reply audio is in the air the mic frames
+            # are dropped (echo guard), and in the gaps the user can talk
+            # into the mailbox.
             log("agent busy — STT off (GPU free), mic to mailbox, "
-                "reply buffered")
+                "reply spoken live")
         else:
             self._busy_since_seq = 0
             self.spoken.set_paused(False)
@@ -670,7 +677,7 @@ class CodingVoice:
                 self._drain_mailbox()
             except Exception as e:
                 log(f"mailbox drain failed: {type(e).__name__}: {e}")
-            log("agent done — speaking buffered reply")
+            log("agent done — mic returns after reply audio")
 
     def _on_event(self, ev: dict) -> None:
         # Drop leftovers from a session we no longer follow (the follow
