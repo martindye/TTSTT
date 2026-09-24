@@ -62,6 +62,18 @@ DEFAULT_REPO = "kyutai/tts-1.6b-en_fr"
 # the model appends its own <.sig@epoch.safetensors> embedding suffix.
 DEFAULT_VOICE = "vctk/p277_023.wav"  # VCTK 277: UK, female
 
+# The 23 "freeform" moods of the EARS p003 speaker (kyutai/tts-voices:
+# ears/p003/emo_<mood>_freeform.wav plus a per-voice embedding each; the
+# names keep the repo's original spelling: embarassment, extasy).
+MOODS = (
+    "adoration", "amazement", "amusement", "anger", "confusion",
+    "contentment", "cuteness", "desire", "disappointment", "disgust",
+    "distress", "embarassment", "extasy", "fear", "guilt", "interest",
+    "neutral", "pain", "pride", "realization", "relief", "sadness",
+    "serenity",
+)
+DEFAULT_MOOD_SPEAKER = "ears/p003"
+
 # Cold-start lead-in cleanup (see _clean_lead). Measured on this box with
 # drop_frames=0 over five sentences: the pre-word hum stays below
 # 0.021 RMS in 10 ms windows (typically 40-160 ms long, plus a small
@@ -97,7 +109,8 @@ class KyutaiTTS16B:
                  n_q: int = 32, temp: float = 0.6, cfg_coef: float = 2.0,
                  device: str = "cuda", repo: str = DEFAULT_REPO,
                  initial_padding: int = 2, max_padding: int = 8,
-                 drop_frames: int = 0):
+                 drop_frames: int = 0, moods: bool = False,
+                 mood_speaker: str = DEFAULT_MOOD_SPEAKER):
         # Imported lazily so that merely importing this module (e.g. from
         # coding_voice.py's default pocket path) never pulls in torch.
         # This box cannot reach the Hugging Face hub; without this the
@@ -205,11 +218,27 @@ class KyutaiTTS16B:
         mimi.set_num_codebooks(n_q if not multistream else n_q // 2)
         self.sample_rate = int(mimi.sample_rate)
 
-        voice_name = self._normalise_voice(voice)
+        # Mood mode: the voice is the speaker's neutral cut, and every one
+        # of the speaker's moods is preloaded (background thread below) so
+        # a later set_mood() is a dict lookup, not a re-encode. The `voice`
+        # argument is ignored in this mode.
+        if moods:
+            voice_name = (f"{mood_speaker.rstrip('/')}"
+                          "/emo_neutral_freeform.wav")
+            shown = f"moods[{mood_speaker}]"
+            if voice != DEFAULT_VOICE:
+                log.info("moods on: --voice %s ignored "
+                         "(the mood voice is the %s set)",
+                         voice, mood_speaker)
+        else:
+            voice_name = self._normalise_voice(voice)
+            shown = voice
         self._voice_path = self._model.get_voice_path(voice_name)
-        log.info("voice: %s -> %s", voice, self._voice_path)
+        log.info("voice: %s -> %s", shown, self._voice_path)
         self._conditions = self._model.make_condition_attributes(
             [self._voice_path], cfg_coef=cfg_coef)
+        self._cfg_coef = cfg_coef
+        self._moods: dict = {}  # mood -> condition attributes (preloaded)
 
         try:
             # torch.compile needs Triton (unavailable on Windows) ->
@@ -222,6 +251,16 @@ class KyutaiTTS16B:
                 self._model.warmup([self._conditions], iters=2)
         except Exception:
             log.exception("Kyutai TTS warmup failed (continuing anyway)")
+
+        if moods:
+            # Preload in the background: 22 clips of ~60 s of reference
+            # audio to encode, so keep the bridge usable (in neutral)
+            # even if the first turns land before the last mood is in.
+            # A mood that is not loaded yet simply keeps the current
+            # voice (set_mood returns False).
+            threading.Thread(
+                target=self._preload_moods, args=(mood_speaker,),
+                daemon=True, name="kyutai-moods").start()
 
         if torch.cuda.is_available():
             log.info("Kyutai TTS 1.6B ready; VRAM in use: %.2f GB",
@@ -245,6 +284,56 @@ class KyutaiTTS16B:
         if not v.lower().endswith(".wav"):
             v += ".wav"
         return v
+
+    # --------------------------------------------------------------- moods
+    def _preload_moods(self, mood_speaker: str) -> None:
+        """Encode every freeform mood of the speaker once, up front.
+
+        Each mood is a ~60 s reference clip. Encoded once at start-up the
+        condition sets cost a few MB of VRAM in total, and from then on a
+        mood switch is a dict lookup that touches nothing the model cares
+        about mid-sentence (generate() reads ``self._conditions`` once, at
+        the start of each sentence).
+        """
+        import time
+
+        base = mood_speaker.rstrip("/")
+        t0 = time.monotonic()
+        for mood in MOODS:
+            if mood == "neutral":
+                continue  # the initial voice is already neutral
+            rel = f"{base}/emo_{mood}_freeform.wav"
+            try:
+                path = self._model.get_voice_path(rel)
+                self._moods[mood] = self._model.make_condition_attributes(
+                    [path], cfg_coef=self._cfg_coef)
+                log.info("mood ready: %s (%d loaded)", mood,
+                         len(self._moods))
+            except Exception:
+                log.exception("mood preload failed: %s", rel)
+        # Register neutral itself so a mood can always be *reset* back to
+        # the starting voice (set_mood("neutral") works like any other).
+        self._moods["neutral"] = self._conditions
+        log.info("mood preload done: %d moods in %.1f s",
+                 len(self._moods), time.monotonic() - t0)
+
+    def set_mood(self, mood: str) -> bool:
+        """Speak subsequent sentences in ``mood``.
+
+        Call it between sentences (the bridge switches at turn
+        boundaries): generation reads ``self._conditions`` at the start
+        of each sentence, so the swap is free and never splits a
+        sentence. Returns False when the mood is not loaded (the current
+        voice is kept).
+        """
+        cond = self._moods.get(mood)
+        if cond is None:
+            return False
+        self._conditions = cond
+        return True
+
+    def mood_loaded(self, mood: str) -> bool:
+        return mood in self._moods
 
     # --------------------------------------------------------------- stream
     def _clean_lead(self, arr: np.ndarray, state: dict) -> np.ndarray:
@@ -405,6 +494,10 @@ def main(argv=None) -> int:
     ap.add_argument("--cfg-coef", type=float, default=2.0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--repo", default=DEFAULT_REPO)
+    ap.add_argument("--moods", action="store_true",
+                    help="mood mode: neutral cut of the EARS p003 "
+                         "speaker, all 23 moods preloaded (voice arg "
+                         "ignored)")
     ap.add_argument("--text",
                     default="This is the Pro voice. If you can hear this "
                             "clearly, the big model is working.")
@@ -416,7 +509,8 @@ def main(argv=None) -> int:
     engine = KyutaiTTS16B(voice=args.voice,
                           quantize=not args.no_quantize,
                           n_q=args.n_q, cfg_coef=args.cfg_coef,
-                          device=args.device, repo=args.repo)
+                          device=args.device, repo=args.repo,
+                          moods=args.moods)
 
     t0 = time.monotonic()
     chunks = list(engine.stream_sentence(args.text, None))

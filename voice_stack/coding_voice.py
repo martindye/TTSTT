@@ -134,21 +134,39 @@ def _make_bridge_tts(args):
     fallback also speaks live.
 
     pocket (default): the small local model, behaviour unchanged.
-    kyutai16b: the big Kyutai 1.6B model, int8-quantised on the GPU
-    (~2 GB VRAM, much better voice, ~1.3 s of startup latency per
-    sentence from the audio delay). If the big model fails to load for
-    any reason, fall back to the pocket model so the bridge still starts.
+    kyutai16b: the big Kyutai 1.6B model (much better voice, ~1.3 s of
+    startup latency per sentence from the audio delay). With moods on
+    (the default for this engine) the voice is the EARS p003 speaker and
+    each reply is spoken in the mood that fits how the turn went; with
+    moods off the voice is --tts-voice, defaulting to the Liverpool cut
+    vctk/p277_023. If the big model fails to load for any reason, fall
+    back to the pocket model so the bridge still starts.
     """
     quantize = args.tts_quantize != "none"
+    moods_choice = getattr(args, "tts_moods", None)
     if args.tts_engine != "kyutai16b":
+        if moods_choice is not None:
+            log("TTS: --tts-moods needs the Pro engine; "
+                "pocket ignores it")
         return make_tts(args.tts_language, args.tts_voice, quantize), False
-    pro_voice = (args.tts_voice if args.tts_voice and args.tts_voice != "anna"
-                 else "vctk/p277_023.wav")
+    moods_on = (moods_choice or "auto") == "auto"
+    if moods_on:
+        if args.tts_voice and args.tts_voice != "anna":
+            log("TTS: moods on, so --tts-voice "
+                f"{args.tts_voice} is ignored (the mood voice is the "
+                "EARS p003 set)")
+        pro_voice = "ears/p003 (23 moods, preloaded at start)"
+    else:
+        pro_voice = (args.tts_voice if args.tts_voice and args.tts_voice != "anna"
+                     else "vctk/p277_023.wav")
     log(f"TTS: loading the big model (kyutai16b, voice={pro_voice}, "
         f"quantized={quantize}) - first load can take a minute...")
     try:
         from .kyutai_tts_engine import KyutaiTTS16B
-        tts = KyutaiTTS16B(voice=pro_voice, quantize=quantize)
+        if moods_on:
+            tts = KyutaiTTS16B(quantize=quantize, moods=True)
+        else:
+            tts = KyutaiTTS16B(voice=pro_voice, quantize=quantize)
         log(f"TTS: big model ready (kyutai 1.6b, {tts.sample_rate} Hz, "
             f"int8={quantize})")
         return tts, True
@@ -162,6 +180,61 @@ def _make_bridge_tts(args):
 
 def _norm(s: str) -> str:
     return " ".join(s.split())
+
+
+# ---------------------------------------------------------------------------
+# Mood picking (Pro engine, moods on): how the turn went -> which of the
+# speaker's moods speaks the reply. The reply's own words are the only
+# signal the bridge can trust (tool results and reasoning are never
+# visible to it), so this is plain word scanning over the text that is
+# about to be spoken. Order: distress first (a crash is never buried),
+# then the win before the failure it fixed ("the error is fixed" is
+# good news), then the plain failures. The word tables are the
+# discretionary part of the design - retune freely.
+# ---------------------------------------------------------------------------
+
+_MOOD_DISTRESS = ("crash", "broken", "gave up", "give up", "no luck",
+                  "stuck", "blocked", "wrecked", "disaster", "ruined")
+_MOOD_WIN = ("fixed", "works", "working", "worked", "passed", "passing",
+             "done", "success", "succeeded", "resolved", "solved",
+             "deployed", "shipped", "sorted", "all good", "ready to go")
+_MOOD_FAIL = ("fail", "error", "didn't work", "doesn't work",
+              "does not work", "still not", "regression", "can't",
+              "cannot", "nope")
+_MOOD_PUZZLE = ("not sure", "unclear", "puzzl", "mystery", "no idea",
+                "baffl")
+_MOOD_FUNNY = ("funny", "hilarious", "bizarre", "weird", "haha")
+_MOOD_PROBE = ("looked", "looking", "tried", "trying", "checked",
+               "investigat", "digging")
+
+
+def pick_mood(text: str) -> str:
+    """Pick the speaking mood for a turn from the turn's own words.
+
+    Returns one of the EARS mood names (see kyutai_tts_engine.MOODS);
+    'neutral' when nothing matches. Deliberately conservative: most
+    turns should land on neutral or contentment, and the strong moods
+    need strong words.
+    """
+    t = " " + re.sub(r"[^a-z']+", " ", (text or "").lower()) + " "
+    # Negated signals are the opposite signal: "no errors" is good news,
+    # "not working" is a failure — strip the negative forms first so
+    # "working" and "done" cannot leak through them.
+    t = re.sub(r"\b(not working|not done|no crashes?|no errors?|"
+               r"no fails?ures?)\b", " ", t)
+    if any(w in t for w in _MOOD_DISTRESS):
+        return "distress"
+    if any(w in t for w in _MOOD_WIN):
+        return "pride" if " finally " in t else "contentment"
+    if any(w in t for w in _MOOD_FAIL):
+        return "disappointment"
+    if any(w in t for w in _MOOD_PUZZLE):
+        return "confusion"
+    if any(w in t for w in _MOOD_FUNNY):
+        return "amusement"
+    if len(t) > 500 and any(w in t for w in _MOOD_PROBE):
+        return "interest"
+    return "neutral"
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +281,13 @@ class SpokenTurn:
         the speaker queue). The mic must not be released while this holds,
         otherwise the bridge hears and transcribes its own voice."""
         return self._draining or bool(self._pending)
+
+    @property
+    def pending_text(self) -> str:
+        """The buffered, not-yet-spoken reply (Pro mode holds the whole
+        turn here until the end). Used to pick the reply's mood before
+        the drain starts, so the whole reply comes out in one mood."""
+        return " ".join(self._pending)
 
     @property
     def tts_generating(self) -> bool:
@@ -496,6 +576,8 @@ class CodingVoice:
         # spoken at turn end. The pocket model coexists with the LLM and
         # speaks live during the turn (the original behaviour).
         self.tts_pro = tts_pro
+        # Last mood actually applied to the Pro engine (moods on only).
+        self._mood = "neutral"
         self.gw = gw
         self._utterance_max = utterance_max  # s; long-utterance safety cap
         self.speakers = SpeakerPlayback(sample_rate=tts.sample_rate,
@@ -808,6 +890,7 @@ class CodingVoice:
                     "reply spoken live")
         else:
             self._busy_since_seq = 0
+            self._apply_mood()
             self.spoken.set_paused(False)
             if self.tts_pro:
                 def _deferred_mailbox():
@@ -841,6 +924,27 @@ class CodingVoice:
                 except Exception as e:  # noqa: BLE001
                     log(f"mailbox drain failed: {type(e).__name__}: {e}")
             log("agent done — mic returns after reply audio")
+
+    def _apply_mood(self) -> None:
+        """Moods on (Pro engine only): pick this reply's mood from the
+        reply's own words and switch the voice BEFORE the buffered reply
+        drains, so the whole reply comes out in one mood. The mood
+        carries over otherwise: an unknown or not-yet-loaded mood is a
+        no-op, and the engine simply keeps its current condition set.
+        Pocket has no moods (no set_mood), so this is a no-op there.
+        """
+        set_mood = getattr(self.tts, "set_mood", None)
+        if not (self.tts_pro and set_mood):
+            return
+        text = self.spoken.pending_text or self.spoken.spoken_text
+        mood = pick_mood(text)
+        if set_mood(mood):
+            if mood != self._mood:
+                log(f"mood: {self._mood} -> {mood}")
+            self._mood = mood
+        elif mood != "neutral":
+            log(f"mood: want {mood} but it is not loaded yet; "
+                f"keeping {self._mood}")
 
     def _on_event(self, ev: dict) -> None:
         # Drop leftovers from a session we no longer follow (the follow
@@ -1223,6 +1327,12 @@ def main() -> int:
                     help="pocket: int4 (default) or none; kyutai16b: int8 "
                          "(default; 'int4' is accepted and means int8) or "
                          "none (full precision, ~3.7 GB VRAM)")
+    ap.add_argument("--tts-moods", default=None, choices=["auto", "off"],
+                    help="Pro engine only. auto (default) = each reply is "
+                         "spoken in the EARS p003 mood that fits how the "
+                         "turn went (23 moods, preloaded at start, neutral "
+                         "fallback); off = one fixed voice: --tts-voice, "
+                         "defaulting to the Liverpool cut vctk/p277_023")
     ap.add_argument("--stt-model", default="fast",
                     choices=sorted(STT_MODEL_REPOS),
                     help="STT model. fast = stt-1b-en_fr, ~0.5 s delay "
