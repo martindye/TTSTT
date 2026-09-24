@@ -105,9 +105,10 @@ def _free_vram_bytes() -> int | None:
 # Half-duplex: ignore the mic this long after our own audio stops.
 VOICE_TAIL_S = 1.0
 
-# At turn end only this much of the mailbox is transcribed (the rest is
-# stale by then). The ring itself still holds 5 min.
-MAX_MAIL_DRAIN_S = 60.0
+# At turn end at most this much of the mailbox is transcribed (anything
+# older is dropped). 3 min (Martin, Oct 2026): long turns can no longer
+# eat the speaker's words. The ring itself holds 5 min.
+MAX_MAIL_DRAIN_S = 180.0
 FRAME_S = 0.08
 
 # Cycle the follow stream this often (server idle-closes at ~75 s).
@@ -124,6 +125,39 @@ FLOOR_LOG_ONCE = True
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%H:%M:%S')} {LOG_PREFIX} {msg}", flush=True)
+
+
+def _make_bridge_tts(args):
+    """Build the bridge's TTS engine. Returns (tts, tts_pro) where tts_pro
+    says whether the LOADED model is the big one — the pause logic below
+    keys off the loaded model, not the requested engine, so a pocket
+    fallback also speaks live.
+
+    pocket (default): the small local model, behaviour unchanged.
+    kyutai16b: the big Kyutai 1.6B model, int8-quantised on the GPU
+    (~2 GB VRAM, much better voice, ~1.3 s of startup latency per
+    sentence from the audio delay). If the big model fails to load for
+    any reason, fall back to the pocket model so the bridge still starts.
+    """
+    quantize = args.tts_quantize != "none"
+    if args.tts_engine != "kyutai16b":
+        return make_tts(args.tts_language, args.tts_voice, quantize), False
+    pro_voice = (args.tts_voice if args.tts_voice and args.tts_voice != "anna"
+                 else "vctk/p277_023.wav")
+    log(f"TTS: loading the big model (kyutai16b, voice={pro_voice}, "
+        f"quantized={quantize}) - first load can take a minute...")
+    try:
+        from .kyutai_tts_engine import KyutaiTTS16B
+        tts = KyutaiTTS16B(voice=pro_voice, quantize=quantize)
+        log(f"TTS: big model ready (kyutai 1.6b, {tts.sample_rate} Hz, "
+            f"int8={quantize})")
+        return tts, True
+    except Exception:
+        import traceback
+        log("TTS: big model failed to load - "
+            "falling back to the pocket TTS")
+        traceback.print_exc()
+        return make_tts(args.tts_language, args.tts_voice, quantize), False
 
 
 def _norm(s: str) -> str:
@@ -144,9 +178,23 @@ class SpokenTurn:
         self.speakers = speakers
         self.on_audio = on_audio
         self.cancel = cancel
+        self._tts_gen = 0  # sentences currently mid-generation (see _speak)
+        self._gen_lock = threading.Lock()
         self.reset_turn()
 
     def reset_turn(self) -> None:
+        # An interruption (new user utterance) must not eat the previous
+        # reply's unspoken tail: flush whatever is still buffered through
+        # the TTS queue before clearing the turn state. (getattr: the first
+        # call comes from __init__, before these attributes exist — nothing
+        # to flush then.)
+        if getattr(self, "buf", "").strip():
+            try:
+                self._pump()
+                if self.buf.strip():
+                    self._speak(self.buf.strip())
+            except Exception as e:  # noqa: BLE001
+                log(f"reset_turn flush failed: {type(e).__name__}: {e}")
         self.spoken_text = ""
         self.buf = ""
         self.block_type: dict[int, str] = {}
@@ -161,11 +209,22 @@ class SpokenTurn:
         otherwise the bridge hears and transcribes its own voice."""
         return self._draining or bool(self._pending)
 
+    @property
+    def tts_generating(self) -> bool:
+        """True while the TTS model is actually generating a sentence.
+        STT inference must not run then: a second model on the GPU
+        corrupts the in-flight CUDA graph capture ("operation not
+        permitted when stream is capturing"), and the sticky capture
+        error silences every later sentence in the process."""
+        return self._tts_gen > 0
+
     def set_paused(self, paused: bool) -> None:
         """While paused, sentences are buffered, not spoken; on un-pause the
         buffer is played back (in its own thread, so the event loop is never
-        blocked). Agent turns no longer pause the pipeline (the reply is
-        spoken live), but the mechanism is kept for explicit pauses."""
+        blocked). Only the big (Pro) TTS model is ever paused: it cannot
+        share the GPU with the agent's LLM, so its reply is spoken in full
+        only after the agent has finished. The pocket model is small
+        enough to coexist with the LLM and speaks live, unpaused."""
         self._paused = paused
         if not paused and self._pending:
             self._draining = True
@@ -182,7 +241,8 @@ class SpokenTurn:
         finally:
             self._draining = False
 
-    MAX_PENDING = 20  # ~2 min of speech; drop oldest beyond that
+    MAX_PENDING = 500  # text only (cheap) — a runaway safety valve, not a
+                       # speech-length limit; drop oldest beyond that
 
     def speak_now(self, sentence: str) -> None:
         """Speak immediately even while paused (canned lines)."""
@@ -229,27 +289,66 @@ class SpokenTurn:
                 self._pending.pop(0)
             self.spoken_text += sentence + " "
             return
+        # Raw text straight to the model: Martin judged its own number-
+        # reading fine (23/09). text_norm.py stays on disk as a dormant
+        # fallback should raw digits ever misbehave again.
+        log(f"tts: {sentence[:60]!r}")
+        with self._gen_lock:
+            self._tts_gen += 1
         try:
+            import numpy as _np
+            peak, n = 0.0, 0
             for audio in self.tts.stream_sentence(sentence, self.cancel):
                 if self.cancel.is_set():
-                    return
+                    break
+                if isinstance(audio, (bytes, bytearray)):
+                    a = _np.frombuffer(audio, dtype=_np.float32)
+                else:
+                    a = _np.asarray(audio, dtype=_np.float32)
+                if a.size:
+                    p = float(_np.abs(a).max())
+                    if p > peak:
+                        peak = p
+                    n += 1
                 self.speakers.write(audio)
                 if self.on_audio:
                     self.on_audio()
+            log(f"tts audio: {n} chunk(s), peak={peak:.3f}")
         except Exception as e:
             log(f"TTS failed: {e}")
+        finally:
+            with self._gen_lock:
+                self._tts_gen -= 1
         self.spoken_text += sentence + " "
 
     # -- snapshot replay -----------------------------------------------------
     def resume_with(self, full_text: str) -> None:
-        """Speak the part of `full_text` not yet spoken (word-overlap dedup)."""
+        """Speak the part of `full_text` not yet spoken.
+
+        The live stream speaks a message in order from its start, so what we
+        have already said of THIS message is a prefix of it, sitting at the
+        tail of spoken_text (spoken_text also holds words of earlier
+        messages of the turn — those must not count). Align on the longest
+        such prefix; if there is no head overlap at all (we joined
+        mid-message, or spoken_text belongs to other messages) speak the
+        whole message: an echo is acceptable, a dropped tail is not.
+        """
         words = (full_text or "").split()
-        n = len(self.spoken_text.split())
-        if n >= len(words):
+        if not words:
             return
-        rest = " ".join(words[n:])
+        spoken = self.spoken_text.split()
+        m, s = len(words), len(spoken)
+        k = 0
+        if s:
+            for kk in range(min(m, s), 0, -1):
+                if spoken[s - kk:] == words[:kk]:
+                    k = kk
+                    break
+        if k >= m:
+            return  # fully spoken already
+        rest = " ".join(words[k:])
         if rest.strip():
-            log(f"resuming reply, {len(words) - n} words left")
+            log(f"resuming reply, {m - k} words left")
             self.buf = rest
             self._pump()
             # Whatever _pump left is a trailing fragment; keep it buffered.
@@ -388,9 +487,15 @@ class CodingVoice:
     """Mic -> STT -> gateway inject; session stream -> spoken reply -> TTS."""
 
     def __init__(self, stt, tts, gw: GatewaySession,
-                 mic_device=None, spk_device=None, utterance_max=120.0):
+                 mic_device=None, spk_device=None, utterance_max=120.0,
+                 tts_pro: bool = False):
         self.stt = stt
         self.tts = tts
+        # True while the LOADED TTS engine is the big GPU model: it cannot
+        # share the GPU with the agent's LLM, so the reply is buffered and
+        # spoken at turn end. The pocket model coexists with the LLM and
+        # speaks live during the turn (the original behaviour).
+        self.tts_pro = tts_pro
         self.gw = gw
         self._utterance_max = utterance_max  # s; long-utterance safety cap
         self.speakers = SpeakerPlayback(sample_rate=tts.sample_rate,
@@ -425,8 +530,10 @@ class CodingVoice:
         self._utterance_start = 0.0
         self._last_word_at = 0.0
         # Agent-busy: while a turn of THIS session is running, the STT model
-        # is OFF (zero GPU for the agent's thinking), TTS is off, and the mic
-        # goes to a bounded mailbox that is transcribed right after the turn.
+        # is OFF (zero GPU for the agent's thinking); the Pro TTS buffers
+        # the reply and speaks it at turn end, the pocket TTS speaks it
+        # live; the mic goes to a bounded mailbox transcribed after the
+        # turn.
         self._busy = False
         self._busy_notified = False
         # Seq (session-global) of the first chunk that armed _busy. A
@@ -466,10 +573,15 @@ class CodingVoice:
         #    back as 'user speech' (the self-echo loop).
         if self._speaking():
             return
-        if self._busy:
-            # Keep the GPU 100% free for the agent's thinking: no STT feed,
-            # hold the user's audio (ring buffer) and transcribe it when the
-            # turn ends, so nothing they said is lost.
+        if self._busy or self.spoken.busy_audio:
+            # Keep the GPU 100% free for the agent's thinking and for the
+            # reply's TTS drain: no STT feed, hold the user's audio (ring
+            # buffer) and transcribe it when the window closes, so nothing
+            # they said is lost. (busy_audio = reply audio buffered or
+            # draining: an STT frame here would collide with the TTS
+            # model's CUDA graph capture and silence the whole reply.
+            # Note the _speaking() check above still drops frames while
+            # our own reply audio is in the air — echo, not the user.)
             self._mailbox.append(pcm)
             return
         if self._stt_queue.full():
@@ -519,6 +631,18 @@ class CodingVoice:
                 pcm = self._stt_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if self._stop.is_set():
+                break
+            # STT and TTS must never run on the GPU at the same time: an
+            # STT frame while the TTS model is mid-generation corrupts
+            # its CUDA graph capture ("operation not permitted when
+            # stream is capturing"), and the sticky capture error then
+            # silences every later sentence in the process. Hold the
+            # frame (and whatever is queued behind it) until the reply
+            # audio and any canned line are done.
+            while (self.spoken.busy_audio or self.spoken.tts_generating
+                   ) and not self._stop.is_set():
+                time.sleep(0.2)
             if self._stop.is_set():
                 break
             is_mail = False
@@ -650,6 +774,12 @@ class CodingVoice:
             return False
         log(f"retarget: {self.gw.session_id} -> {sid}")
         self.gw.session_id = sid
+        # Drop per-session state so the old session can't contaminate the
+        # new one: its spoken words would inflate resume_with's dedup count
+        # (silently truncating the new session's first replies), and a stale
+        # _turn_done / busy watermark would misfire the snapshot recovery.
+        self.spoken.reset_turn()
+        self._turn_done.clear()
         return True
 
     # --------------------------------------------------- session stream in
@@ -659,24 +789,57 @@ class CodingVoice:
         self._busy = busy
         if busy:
             self._busy_notified = False
-            # TTS keeps running LIVE during the turn: the user wants to hear
-            # the work happen as it happens (context matters), and the TTS
-            # model is small enough to coexist with the agent's LLM. STT
-            # stays OFF (GPU for the agent) and the mic feeds the mailbox,
-            # as before; while the reply audio is in the air the mic frames
-            # are dropped (echo guard), and in the gaps the user can talk
-            # into the mailbox.
-            log("agent busy — STT off (GPU free), mic to mailbox, "
-                "reply spoken live")
+            if self.tts_pro:
+                # Big TTS model: PAUSED for the whole turn. The reply text
+                # is buffered (no GPU, no audio) and spoken in full once
+                # the turn ends — the big model and the agent's LLM never
+                # share the GPU in the same moment.
+                self.spoken.set_paused(True)
+                log("agent busy — STT off (GPU free), mic to mailbox, "
+                    "reply buffered, spoken at turn end")
+            else:
+                # Pocket TTS: small enough to coexist with the agent's
+                # LLM, so the reply is spoken live while the agent works.
+                # STT stays OFF (GPU for the agent) and the mic feeds the
+                # mailbox; while the reply audio is in the air the mic
+                # frames are dropped (echo guard), and in the gaps the user
+                # can talk into the mailbox.
+                log("agent busy — STT off (GPU free), mic to mailbox, "
+                    "reply spoken live")
         else:
             self._busy_since_seq = 0
             self.spoken.set_paused(False)
-            # A drain failure must never leave the stream dead or the busy
-            # state stuck: log and continue, the mic hands back regardless.
-            try:
-                self._drain_mailbox()
-            except Exception as e:
-                log(f"mailbox drain failed: {type(e).__name__}: {e}")
+            if self.tts_pro:
+                def _deferred_mailbox():
+                    # Transcribe the mailbox only AFTER the reply audio has
+                    # finished: STT and TTS must never share the GPU (their
+                    # CUDA streams collide mid graph-capture — see the
+                    # 09:53 "operation not permitted when stream is capturing"
+                    # hit), and by the time a long reply has played, older
+                    # mailbox audio is stale anyway.
+                    try:
+                        while (self.spoken.busy_audio
+                               or self.speakers.pending_seconds > 0.05):
+                            if self._stop.is_set():
+                                return
+                            time.sleep(0.2)
+                        self._drain_mailbox()
+                    except Exception as e:  # noqa: BLE001
+                        log(f"mailbox drain failed: {type(e).__name__}: {e}")
+
+                threading.Thread(target=_deferred_mailbox,
+                                 daemon=True).start()
+            else:
+                # The reply was spoken live, so drain right away. A drain
+                # failure must never leave the stream dead or the busy
+                # state stuck: log and continue, the mic hands back either
+                # way. The STT worker still holds its frames while the TTS
+                # model is mid-sentence (tts_generating gate), so this
+                # never collides with a live sentence.
+                try:
+                    self._drain_mailbox()
+                except Exception as e:  # noqa: BLE001
+                    log(f"mailbox drain failed: {type(e).__name__}: {e}")
             log("agent done — mic returns after reply audio")
 
     def _on_event(self, ev: dict) -> None:
@@ -795,6 +958,12 @@ class CodingVoice:
                 if ev.get("type") == "assistant/chunk":
                     seq = ev.get("seq") or 0
                     if seq > self._chunk_seq:
+                        # A new chunk means a turn is in flight: re-arm busy
+                        # exactly like the live path does, so a misfired
+                        # release can't leave the mic live mid-reply.
+                        if not self._busy:
+                            self._busy_since_seq = seq
+                            self._set_busy(True)
                         self._chunk_seq = seq
                         chunk = (ev.get("data") or {}).get("chunk")
                         if isinstance(chunk, dict):
@@ -1040,9 +1209,20 @@ def main() -> int:
                          "(default: the TTSTT workspace)")
     ap.add_argument("--gui-home", default=None,
                     help="DSH home (default: $DSH_HOME or ~/.dsh)")
+    ap.add_argument("--tts-engine", default="pocket",
+                    choices=["pocket", "kyutai16b"],
+                    help="TTS backend: pocket = the small local model "
+                         "(default, unchanged); kyutai16b = the big Kyutai "
+                         "TTS 1.6B model, int8-quantised on the GPU "
+                         "(~2 GB extra VRAM, slower to load, much better "
+                         "voice). English only.")
     ap.add_argument("--tts-voice", default="anna")
     ap.add_argument("--tts-language", default="english")
-    ap.add_argument("--tts-quantize", default="int4", choices=["int4", "none"])
+    ap.add_argument("--tts-quantize", default="int4",
+                    choices=["int4", "int8", "none"],
+                    help="pocket: int4 (default) or none; kyutai16b: int8 "
+                         "(default; 'int4' is accepted and means int8) or "
+                         "none (full precision, ~3.7 GB VRAM)")
     ap.add_argument("--stt-model", default="fast",
                     choices=sorted(STT_MODEL_REPOS),
                     help="STT model. fast = stt-1b-en_fr, ~0.5 s delay "
@@ -1103,12 +1283,11 @@ def main() -> int:
                 "right now. Free up the GPU (e.g. stop the big LLM "
                 "server) or start with --stt-model fast.")
     stt = make_stt(stt_repo, args.stt_device)
-    tts = make_tts(args.tts_language, args.tts_voice,
-                   args.tts_quantize == "int4")
+    tts, tts_pro = _make_bridge_tts(args)
 
     cv = CodingVoice(stt, tts, gw,
                      mic_device=args.mic_device, spk_device=args.spk_device,
-                     utterance_max=args.utterance_max)
+                     utterance_max=args.utterance_max, tts_pro=tts_pro)
     cv.start()
     follower = None
     if args.session is None:

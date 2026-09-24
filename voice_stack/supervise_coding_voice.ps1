@@ -60,7 +60,7 @@ for ($i = 0; $i -lt $pyArgList.Count - 1; $i++) {
     if ($pyArgList[$i] -eq "--stt-model") { $sttModel = $pyArgList[$i + 1] }
 }
 $needStt = if ($sttModel -eq "accurate") { "models--kyutai--stt-2.6b-en" }
-           else { "models--kyutai--stt-1b-en-fr" }
+           else { "models--kyutai--stt-1b-en_fr" }
 $cacheWarm = (Test-Path (Join-Path $hubCache $needStt)) -and
              (Test-Path (Join-Path $hubCache "models--kyutai--pocket-tts-without-voice-cloning"))
 if ($cacheWarm) {
@@ -72,13 +72,24 @@ if ($cacheWarm) {
 
 function Write-State([int]$BridgePid) {
     $ws = ""
-    for ($i = 0; $i -lt $PyArgs.Count - 1; $i++) {
-        if ($PyArgs[$i] -eq "--workspace") { $ws = $PyArgs[$i + 1] }
+    $extra = @()
+    $skip = $false
+    for ($i = 0; $i -lt $PyArgs.Count; $i++) {
+        if ($skip) { $skip = $false; continue }
+        if ($PyArgs[$i] -eq "--workspace") {
+            $ws = $PyArgs[$i + 1]
+            $skip = $true
+        } else {
+            $extra += $PyArgs[$i]
+        }
     }
     $s = [ordered]@{
         supervisor_pid = $PID
         bridge_pid     = $BridgePid
         workspace      = $ws
+        # The extras, minus --workspace and its value: lets the ensure
+        # script notice an engine/voice change and restart the stack.
+        args           = ($extra -join " ")
         started_at     = (Get-Date).ToString("o")
     }
     Set-Content -Path $stateFile -Value ($s | ConvertTo-Json) -Encoding utf8

@@ -86,18 +86,26 @@ if (Test-Path $SkillTpl) {
 # ---------------------------------------------------------------- current
 $wsNorm = $Workspace.TrimEnd('\', '/').ToLower()
 $state = Read-State
-$bridgePid = 0; $supPid = 0; $stateWs = ""
+$bridgePid = 0; $supPid = 0; $stateWs = ""; $stateArgs = ""
 if ($state) {
     $bridgePid = [int]$state.bridge_pid
     $supPid    = [int]$state.supervisor_pid
     $stateWs   = ([string]$state.workspace).TrimEnd('\', '/').ToLower()
+    # Old state files have no args field: that reads as "".
+    $stateArgs = [string]$state.args
 }
 $bridgeAlive = ($bridgePid -gt 0) -and (Get-Process -Id $bridgePid -ErrorAction SilentlyContinue)
 $supAlive    = ($supPid -gt 0) -and (Get-Process -Id $supPid -ErrorAction SilentlyContinue)
 $logFresh = (Test-Path $LogFile) -and
     (((Get-Item $LogFile).LastWriteTime -gt (Get-Date).AddSeconds(-90)))
 
-if ($bridgeAlive -and $supAlive -and $logFresh -and ($stateWs -ceq $wsNorm)) {
+# The stack only counts as "already right" if the bridge extras match the
+# ones requested now (same engine/voice/language). A state file with no
+# args field (older supervisor) matches only a call with no extras.
+$extraNorm = ((@($ExtraArgs | Where-Object { $_ }) -join " ").Trim()).ToLower()
+$argsMatch = ($stateArgs -eq $extraNorm)
+if ($bridgeAlive -and $supAlive -and $logFresh -and
+        ($stateWs -ceq $wsNorm) -and $argsMatch) {
     # Last "speaking into session-..." line in the log is where it talks now.
     $cur = ""
     $tail = Get-Content $LogFile -Tail 400 -ErrorAction SilentlyContinue
