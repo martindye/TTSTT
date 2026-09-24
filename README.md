@@ -8,15 +8,20 @@ tools (files, shell), can hand coding work off to a full coding agent, and
 persists its conversation per bridge run. Sentence-streamed: audio starts
 while the model is still thinking through the answer.
 
-```
-        ┌──────────┐ 80ms frames  ┌──────────────┐ word-gap ┌──────────────────────────┐
- mic ─▶│ PortAudio │─────────────▶│ Kyutai STT 1B│ endpoint│ DSH voice session         │
-        └──────────┘   12.5 fps   │   (GPU)      │  = 1.2s  │ qwen3.8-27b @ llama.cpp  │
-                                 └──────────────┘  gap     │ (llama-server :8080)      │
-        ┌──────────┐  24 kHz PCM ┌──────────────┐          └─────────────┬──────────────┘
-        │ speakers ◀──────────────│ Pocket TTS  │◀── spoken text only ───┘
-        └──────────┘             │ (CPU, INT4)  │    (thinking never
-                                 └──────────────┘     spoken)
+```mermaid
+flowchart LR
+    mic(["mic"])
+    pa["PortAudio"]
+    stt["Kyutai STT 1B<br/>(GPU)"]
+    dsh["DSH voice session<br/>qwen3.8-27b @ llama.cpp<br/>(llama-server :8080)"]
+    tts["Pocket TTS<br/>(CPU, INT4)"]
+    spk(["speakers"])
+
+    mic --> pa
+    pa -->|"80 ms frames, 12.5 fps"| stt
+    stt -->|"word-gap endpointing (1.2 s gap)"| dsh
+    dsh -->|"spoken text only (thinking never spoken)"| tts
+    tts -->|"24 kHz PCM"| spk
 ```
 
 ## Quick start
