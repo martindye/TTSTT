@@ -239,6 +239,10 @@ class KyutaiTTS16B:
             [self._voice_path], cfg_coef=cfg_coef)
         self._cfg_coef = cfg_coef
         self._moods: dict = {}  # mood -> condition attributes (preloaded)
+        # Engine-level mood switching (set_mood) exists only in this mode;
+        # with moods off the bridge's per-segment switching is a no-op and
+        # its mood log lines stay quiet.
+        self.moods_enabled = bool(moods)
 
         try:
             # torch.compile needs Triton (unavailable on Windows) ->

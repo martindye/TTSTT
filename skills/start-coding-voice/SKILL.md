@@ -67,6 +67,10 @@ Useful options (append to the command):
   javert, bill_boerst, peter_yearsley, stuart_bell, ...).
 - `--utterance-max <seconds>` — how long the user may keep talking before
   their utterance is sent anyway (default 120 = two minutes).
+- `--final-silence <seconds>` — real silence required after a full stop
+  before the sentence is sent (default 3). The STT drops a full stop on any
+  pause, including a mid-sentence breath; a smaller value re-introduces
+  mid-sentence cut-offs.
 - `--gui <url>` — default `http://127.0.0.1:3080`.
 
 ## Auto-follow (any window in the target workspace)
@@ -142,12 +146,13 @@ removes the sentinel and its state file itself when it exits).
   says in a gap goes to a mailbox (ring buffer), and when the turn ends the
   most recent 60 s of it is transcribed and sent, so nothing recent is lost
   without replaying minutes of old audio.
-- Utterance ending is lenient: a short utterance that ends in . ! ? sends
-  after ~0.6 s; an unpunctuated short utterance (3-12 words, a command)
-  sends only after 6 s of real silence; fragments shorter than 3 words are
-  never sent on their own — they merge with whatever the user says next.
-  Everything else holds the door open until `--utterance-max`
-  (default 2 minutes).
+- Utterance ending is lenient: a sentence ending in . ! ? sends only after
+  `--final-silence` s of real silence (default 3 — the STT drops a full stop
+  on any pause, so a bare full stop never sends on its own); an unpunctuated
+  short utterance (3-12 words, a command) sends only after 6 s of real
+  silence; fragments shorter than 3 words are never sent on their own — they
+  merge with whatever the user says next. Everything else holds the door open
+  until `--utterance-max` (default 2 minutes).
 - The bridge also speaks replies triggered any other way (typed in the GUI,
   handoffs) — everything the window shows is spoken. That is by design.
 - Logs: {{DASHOME}}\logs\coding_voice.log. Session events are only

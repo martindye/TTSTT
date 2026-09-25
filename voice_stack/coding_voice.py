@@ -58,6 +58,11 @@ from .handoff import (  # noqa: E402
     mint_cookie,
     sessions_dir_for,
 )
+from .mood_tags import (  # noqa: E402
+    count_mood_tags,
+    has_mood_tags,
+    mood_segs,
+)
 
 LOG_PREFIX = "coding-voice:"
 
@@ -66,10 +71,14 @@ LOG_PREFIX = "coding-voice:"
 WORD_GAP_S = 1.2
 WORD_GAP_SENTENCE_S = 0.6
 # An unpunctuated fragment is only sent after this much continuous silence
-# (it may still be the lead-in to a longer utterance). Punctuated sentences
-# send immediately; long ones after LONG_FINAL_SILENCE_S of real silence.
+# (it may still be the lead-in to a longer utterance).
 COMMAND_SILENCE_S = 6.0
-LONG_FINAL_SILENCE_S = 3.0
+# A sentence ending in full stop / ! / ? is sent only after this much real
+# silence (override with --final-silence). The STT model drops a full stop on
+# ANY pause — a mid-sentence breath counts — so a bare full stop is not proof
+# the user is done: if they resume inside this window the stale stop is
+# simply overtaken. Bigger = fewer false sends, more tail delay.
+FINAL_PUNCT_SILENCE_S = 3.0
 SENTENCE_END_PUNCT = {".", "!", "?", "\u2026", "\u3002", "\uff01", "\uff1f"}
 
 # STT model choices ("--stt-model"). The 2.6B model is English-only and the
@@ -253,6 +262,10 @@ class SpokenTurn:
         self.cancel = cancel
         self._tts_gen = 0  # sentences currently mid-generation (see _speak)
         self._gen_lock = threading.Lock()
+        # The mood the TTS engine is actually in right now (meaningful only
+        # with moods on; everything is a no-op with moods off). Model-tagged
+        # replies may change it between sentences mid-reply.
+        self._engine_mood = "neutral"
         self.reset_turn()
 
     def reset_turn(self) -> None:
@@ -274,6 +287,13 @@ class SpokenTurn:
         self._paused = False
         self._pending: list[str] = []
         self._draining = False
+        # Mood state for THIS reply: untagged sentences come out in
+        # _cur_mood (set per-reply by CodingVoice._apply_mood; when the
+        # model tags the reply it is reset to neutral and then follows the
+        # tags sentence by sentence). _mood_warned dedupes "not loaded
+        # yet" log lines per mood.
+        self._cur_mood = "neutral"
+        self._mood_warned: set[str] = set()
 
     @property
     def busy_audio(self) -> bool:
@@ -356,6 +376,39 @@ class SpokenTurn:
                 return
             self._speak(sent)
 
+    # -- mood switching ------------------------------------------------------
+    def set_engine_mood(self, mood: str) -> bool:
+        """Switch the TTS engine to `mood` and remember it.
+
+        Returns True when the engine is in `mood` now (including the
+        already-there case); False when moods are off or the mood is not
+        loaded yet (the engine then keeps its current voice).
+        """
+        if mood == self._engine_mood:
+            return True
+        if not getattr(self.tts, "moods_enabled", False):
+            return False
+        set_mood = getattr(self.tts, "set_mood", None)
+        if not set_mood or not set_mood(mood):
+            return False
+        log(f"mood: {self._engine_mood} -> {mood}")
+        self._engine_mood = mood
+        return True
+
+    def _ensure_mood(self, mood: str) -> None:
+        """Make sure the engine is in `mood`, logging a refusal at most once
+        per mood per reply (a not-yet-preloaded mood keeps the current
+        voice; moods-off never logs)."""
+        if mood == self._engine_mood:
+            return
+        if self.set_engine_mood(mood):
+            return
+        if getattr(self.tts, "moods_enabled", False) \
+                and mood != "neutral" and mood not in self._mood_warned:
+            self._mood_warned.add(mood)
+            log(f"mood: want {mood} but it is not loaded yet; "
+                f"keeping {self._engine_mood}")
+
     def _speak(self, sentence: str) -> None:
         sentence = sentence.strip()
         if not sentence or self.cancel.is_set():
@@ -373,26 +426,47 @@ class SpokenTurn:
         # reading fine (23/09). text_norm.py stays on disk as a dormant
         # fallback should raw digits ever misbehave again.
         log(f"tts: {sentence[:60]!r}")
+        # Model-tagged moods: the sentence may carry [[mood]] markers, each
+        # a zero-width forward-looking switch (see mood_tags). Untagged
+        # sentences come out in _cur_mood; a tagged sentence ends in its
+        # last tag, which _cur_mood then carries into the next one.
+        segs, last_tag = mood_segs(sentence)
+        if last_tag is None:
+            segs = [(self._cur_mood, sentence)]
+        else:
+            filled = []
+            for mood, text in segs:
+                t = " ".join((text or "").split())
+                if not t:
+                    continue
+                filled.append((mood if mood is not None else self._cur_mood,
+                               t))
+            segs = filled
+            self._cur_mood = last_tag
         with self._gen_lock:
             self._tts_gen += 1
         try:
             import numpy as _np
             peak, n = 0.0, 0
-            for audio in self.tts.stream_sentence(sentence, self.cancel):
-                if self.cancel.is_set():
-                    break
-                if isinstance(audio, (bytes, bytearray)):
-                    a = _np.frombuffer(audio, dtype=_np.float32)
-                else:
-                    a = _np.asarray(audio, dtype=_np.float32)
-                if a.size:
-                    p = float(_np.abs(a).max())
-                    if p > peak:
-                        peak = p
-                    n += 1
-                self.speakers.write(audio)
-                if self.on_audio:
-                    self.on_audio()
+            for mood, seg in segs:
+                if not seg or self.cancel.is_set():
+                    continue
+                self._ensure_mood(mood)
+                for audio in self.tts.stream_sentence(seg, self.cancel):
+                    if self.cancel.is_set():
+                        break
+                    if isinstance(audio, (bytes, bytearray)):
+                        a = _np.frombuffer(audio, dtype=_np.float32)
+                    else:
+                        a = _np.asarray(audio, dtype=_np.float32)
+                    if a.size:
+                        p = float(_np.abs(a).max())
+                        if p > peak:
+                            peak = p
+                        n += 1
+                    self.speakers.write(audio)
+                    if self.on_audio:
+                        self.on_audio()
             log(f"tts audio: {n} chunk(s), peak={peak:.3f}")
         except Exception as e:
             log(f"TTS failed: {e}")
@@ -568,7 +642,7 @@ class CodingVoice:
 
     def __init__(self, stt, tts, gw: GatewaySession,
                  mic_device=None, spk_device=None, utterance_max=120.0,
-                 tts_pro: bool = False):
+                 final_silence=FINAL_PUNCT_SILENCE_S, tts_pro: bool = False):
         self.stt = stt
         self.tts = tts
         # True while the LOADED TTS engine is the big GPU model: it cannot
@@ -576,10 +650,9 @@ class CodingVoice:
         # spoken at turn end. The pocket model coexists with the LLM and
         # speaks live during the turn (the original behaviour).
         self.tts_pro = tts_pro
-        # Last mood actually applied to the Pro engine (moods on only).
-        self._mood = "neutral"
         self.gw = gw
         self._utterance_max = utterance_max  # s; long-utterance safety cap
+        self._final_silence_s = float(final_silence)  # s after a full stop
         self.speakers = SpeakerPlayback(sample_rate=tts.sample_rate,
                                         device=spk_device)
         self.mic = MicCapture(callback=self._on_mic_block,
@@ -783,10 +856,10 @@ class CodingVoice:
         final = last in SENTENCE_END_PUNCT
         silence = time.time() - self._last_word_at
         age = time.time() - self._utterance_start
-        if final and words <= 14:
-            pass  # complete short sentence ("what's the weather?")
-        elif final and silence >= LONG_FINAL_SILENCE_S:
-            pass  # long sentence that ended properly, and a real pause
+        if final and silence >= self._final_silence_s:
+            # Ended properly, and the user has stayed quiet long enough that
+            # a mid-sentence breath (a spurious full stop) is ruled out.
+            pass
         elif (not final) and 3 <= words <= 12 and silence >= COMMAND_SILENCE_S:
             # A short command the user has really stopped speaking
             # ("fix the login bug"). No-punctuation fragments shorter than
@@ -926,25 +999,30 @@ class CodingVoice:
             log("agent done — mic returns after reply audio")
 
     def _apply_mood(self) -> None:
-        """Moods on (Pro engine only): pick this reply's mood from the
-        reply's own words and switch the voice BEFORE the buffered reply
-        drains, so the whole reply comes out in one mood. The mood
-        carries over otherwise: an unknown or not-yet-loaded mood is a
-        no-op, and the engine simply keeps its current condition set.
-        Pocket has no moods (no set_mood), so this is a no-op there.
+        """Moods on (Pro engine only): set this reply's voice BEFORE the
+        buffered reply drains.
+
+        Model-tagged reply (the agent marked it with [[mood]]): the model
+        is in charge — reset to neutral and let SpokenTurn switch per
+        segment as the sentences drain. Untagged reply: the old behaviour,
+        one mood for the whole reply, picked from its words.
         """
-        set_mood = getattr(self.tts, "set_mood", None)
-        if not (self.tts_pro and set_mood):
+        if not (self.tts_pro and getattr(self.tts, "moods_enabled", False)):
             return
         text = self.spoken.pending_text or self.spoken.spoken_text
+        if has_mood_tags(text):
+            n = count_mood_tags(text)
+            self.spoken._cur_mood = "neutral"
+            self.spoken.set_engine_mood("neutral")
+            log(f"mood: tagged reply ({n} marker{'s' if n != 1 else ''}), "
+                f"model-directed")
+            return
         mood = pick_mood(text)
-        if set_mood(mood):
-            if mood != self._mood:
-                log(f"mood: {self._mood} -> {mood}")
-            self._mood = mood
-        elif mood != "neutral":
+        if self.spoken.set_engine_mood(mood):
+            return
+        if mood != "neutral":
             log(f"mood: want {mood} but it is not loaded yet; "
-                f"keeping {self._mood}")
+                f"keeping {self.spoken._engine_mood}")
 
     def _on_event(self, ev: dict) -> None:
         # Drop leftovers from a session we no longer follow (the follow
@@ -1349,6 +1427,13 @@ def main() -> int:
     ap.add_argument("--utterance-max", type=float, default=120.0,
                     help="max seconds a spoken utterance may run before it "
                          "is sent anyway (default 120)")
+    ap.add_argument("--final-silence", type=float,
+                    default=FINAL_PUNCT_SILENCE_S,
+                    help="seconds of real silence required after a full stop "
+                         "/ ! / ? before the sentence is sent (default "
+                         f"{FINAL_PUNCT_SILENCE_S}); the STT drops a full "
+                         "stop on any pause, so a smaller value "
+                         "re-introduces mid-sentence cut-offs")
     ap.add_argument("--list-voices", action="store_true",
                     help="print the available TTS voices and exit")
     args = ap.parse_args()
@@ -1397,7 +1482,8 @@ def main() -> int:
 
     cv = CodingVoice(stt, tts, gw,
                      mic_device=args.mic_device, spk_device=args.spk_device,
-                     utterance_max=args.utterance_max, tts_pro=tts_pro)
+                     utterance_max=args.utterance_max,
+                     final_silence=args.final_silence, tts_pro=tts_pro)
     cv.start()
     follower = None
     if args.session is None:
