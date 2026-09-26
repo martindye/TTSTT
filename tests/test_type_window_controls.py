@@ -28,7 +28,7 @@ class ControlsTest(unittest.TestCase):
         self.assertTrue(window.busy)
         self.assertTrue(window.cancel.is_set())
 
-    def test_complete_passage_has_fixed_seed_and_explicit_emotion(self):
+    def test_passage_uses_the_box_seed_and_explicit_emotion(self):
         window = voice.VoiceWindow.__new__(voice.VoiceWindow)
         window.cancel = threading.Event()
         window._ensure_c_engine = Mock()
@@ -38,12 +38,19 @@ class ControlsTest(unittest.TestCase):
              patch.object(voice.sf, "read", return_value=([0.0], 24000)), \
              patch.object(voice.sd, "play"), patch.object(voice.sd, "wait"):
             post.return_value.content = b"fake wav"
-            window._speak_c("Hello. How are you?", "joy")
+            window._speak_c("Hello. How are you?", "joy", 42)
         post.assert_called_once()
         body = post.call_args.kwargs["json"]
         self.assertEqual(body["input"], "Hello. How are you?")
         self.assertEqual(body["seed"], 42)
         self.assertEqual(body["emotion"], "joy")
+
+    def test_seed_box_falls_back_to_42(self):
+        window = voice.VoiceWindow.__new__(voice.VoiceWindow)
+        window.seed = Mock(get=Mock(return_value="   "))
+        self.assertEqual(voice.VoiceWindow._seed(window), 42)
+        window.seed = Mock(get=Mock(return_value="17"))
+        self.assertEqual(voice.VoiceWindow._seed(window), 17)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,9 @@ running in WSL2, serving the warm British voice as a cloned .qvoice that
 emotes - the emotion box takes a mood word; the six base emotions are
 voiced and anything else falls back to plain speech. The window wakes
 it from WSL on demand and never stops it when it closes.
+
+The designed voice is the window's standard (first and default); a
+seed box next to the emotion box fixes the take (42 unless changed).
 """
 from __future__ import annotations
 
@@ -65,13 +68,14 @@ C_EMOTING = "British female (emoting clone)"
 WINDOW_STATE = ROOT / "tests" / "voice_window_state.json"
 REFERENCE_AUDIO = ROOT / "voice_stack" / "ref_voices" / "british_p225.wav"
 
-# voice label -> (engine, voice id or None)
+# voice label -> (engine, voice id or None). The designed voice is the
+# window's standard: it is first in the list and the default selection.
 VOICES = {
+    DESIGNED: ("design", None),
+    C_EMOTING: ("c", None),
     "pocket (cloned)": ("base", "pocket"),
     "warm-brit (cloned)": ("base", "warm-brit"),
     "p277 (cloned)": ("base", "p277"),
-    C_EMOTING: ("c", None),
-    DESIGNED: ("design", None),
 }
 
 MOOD_LINES = {
@@ -154,7 +158,7 @@ def split_sentences(text: str) -> list:
 class VoiceWindow:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        root.title("TTSTT - type to speak (British voice, revision 2)")
+        root.title("TTSTT - type to speak (British voice, revision 3)")
 
         self.busy = False
         self.closed = False
@@ -166,7 +170,7 @@ class VoiceWindow:
         tk.Label(top, text="Voice:").pack(side="left")
         self.voice_combo = ttk.Combobox(
             top, state="readonly", width=30, values=list(VOICES))
-        self.voice_combo.set(C_EMOTING)
+        self.voice_combo.set(DESIGNED)
         self.voice_combo.pack(side="left", padx=(6, 14), ipady=2)
         self.voice_combo.bind("<<ComboboxSelected>>",
                               lambda _e: self._voice_changed())
@@ -174,13 +178,20 @@ class VoiceWindow:
         self.emotion = tk.Entry(top, width=20)
         self.emotion.pack(side="left", padx=(4, 0), ipady=2)
         self.emotion.config(state="normal")
+        tk.Label(top, text="Seed:").pack(side="left", padx=(14, 0))
+        self.seed = tk.Entry(top, width=8)
+        self.seed.insert(0, "42")
+        self.seed.pack(side="left", padx=(4, 0), ipady=2)
 
         hint = (tk.Label(root, fg="gray", wraplength=740,
                          text="emotion: the designed voice takes any mood word or "
                               "line; the emoting clone takes any mood word too - "
                               "six are voiced (sad, joy, anger, fear, disgust, "
                               "surprise), the rest speak plainly; the plain "
-                              "clones ignore it. Clone emotions are approximate."))
+                              "clones ignore it. Clone emotions are "
+                              "approximate. Seed: same text with the same "
+                              "seed sounds the same; change it for a "
+                              "different take."))
         hint.pack(anchor="w", padx=14)
         self.text = tk.Text(root, wrap="word", height=7, font=("Segoe UI", 12))
         self.text.pack(fill="both", expand=True, padx=10, pady=(4, 4))
@@ -211,7 +222,9 @@ class VoiceWindow:
             self.text.delete("1.0", "end")
             self.text.insert("1.0", state["text"])
             self.emotion.insert(0, state.get("emotion", ""))
-            self.voice_combo.set(state.get("voice") if state.get("voice") in VOICES else C_EMOTING)
+            self.seed.delete(0, "end")
+            self.seed.insert(0, state.get("seed", "42"))
+            self.voice_combo.set(state.get("voice") if state.get("voice") in VOICES else DESIGNED)
             self._voice_changed()
         except (OSError, ValueError, KeyError):
             pass
@@ -251,7 +264,15 @@ class VoiceWindow:
     def _save_state(self) -> None:
         WINDOW_STATE.parent.mkdir(exist_ok=True)
         WINDOW_STATE.write_text(json.dumps({"text": self.text.get("1.0", "end-1c"),
-            "voice": self.voice_combo.get(), "emotion": self.emotion.get()}, ensure_ascii=False), encoding="utf-8")
+            "voice": self.voice_combo.get(), "emotion": self.emotion.get(),
+            "seed": self.seed.get()}, ensure_ascii=False), encoding="utf-8")
+
+    def _seed(self) -> int:
+        """The seed box as an int; 42 when blank or not a number."""
+        try:
+            return int(self.seed.get().strip())
+        except ValueError:
+            return 42
 
     def speak(self, text_override: str | None = None) -> None:
         if self.busy:
@@ -267,6 +288,7 @@ class VoiceWindow:
             return
         emotion = (self.emotion.get()
                    if engine in ("design", "c") else "")
+        seed = self._seed()
         self.busy = True
         self._save_state()
         sd.stop()
@@ -277,8 +299,9 @@ class VoiceWindow:
         self.preview_btn.config(state="disabled")
         self.voice_combo.config(state="disabled")
         self.emotion.config(state="disabled")
+        self.seed.config(state="disabled")
         threading.Thread(target=self._speak,
-                         args=(text, engine, voice, emotion),
+                         args=(text, engine, voice, emotion, seed),
                          daemon=True).start()
 
     def stop(self) -> None:
@@ -293,10 +316,11 @@ class VoiceWindow:
             self.stop_btn.config(state="disabled")
             self._status("Stopped.")
 
-    def _speak(self, text: str, engine: str, voice: str, emotion: str) -> None:
+    def _speak(self, text: str, engine: str, voice: str, emotion: str,
+               seed: int) -> None:
         try:
             if engine == "c":
-                self._speak_c(text, emotion)
+                self._speak_c(text, emotion, seed)
                 return
             self._ensure_engine(engine)
             if self.cancel.is_set():
@@ -315,7 +339,7 @@ class VoiceWindow:
                     "input": sentence,
                     "language": "English",
                     "response_format": "wav",
-                    "seed": 42,
+                    "seed": seed,
                     "max_new_tokens": 768,
                 }
                 if engine == "design":
@@ -343,7 +367,7 @@ class VoiceWindow:
         self._status(message)
 
     # -- C engine (port 8096, WSL) -------------------------------------------
-    def _speak_c(self, text: str, emotion: str) -> None:
+    def _speak_c(self, text: str, emotion: str, seed: int) -> None:
         """Speak a complete passage with the server's fixed British reference."""
         self._ensure_c_engine()
         if self.cancel.is_set():
@@ -362,7 +386,7 @@ class VoiceWindow:
                 "input": sentence,
                 "language": "English",
                 "response_format": "wav",
-                "seed": 42,
+                "seed": seed,
             }
             if em:
                 payload["emotion"] = em
@@ -425,6 +449,7 @@ class VoiceWindow:
             self.reference_btn.config(state="normal")
             self.preview_btn.config(state="normal")
             self.voice_combo.config(state="readonly")
+            self.seed.config(state="normal")
             self._voice_changed()
         self.root.after(0, reset)
 
