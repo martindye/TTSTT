@@ -129,6 +129,22 @@ def _default_voice(engine) -> str:
     return getter if isinstance(getter, str) else ""
 
 
+def _preload() -> None:
+    """Warm every engine so the first /tts is a render, not a model load.
+
+    Runs in a background thread: /health is already serving, and a live
+    request just waits on the engine's own load guard.
+    """
+    from . import tts_engines as engines
+    for eng in engines.engines():
+        try:
+            eng.load()
+            samples, _ = eng.synthesize("Ready.", None)
+            log.info("preloaded %s (%d warm-up samples)", eng.name, samples.size)
+        except Exception:
+            log.exception("preload failed for engine %s", eng.name)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=8188)
@@ -142,6 +158,7 @@ def main() -> int:
 
     server = ThreadingHTTPServer((args.bind, args.port), Handler)
     log.info("TTS server on http://%s:%d (loopback)", args.bind, args.port)
+    threading.Thread(target=_preload, name="tts-preload", daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
