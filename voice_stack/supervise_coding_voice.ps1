@@ -21,6 +21,10 @@
 
 param(
     [string]$LogFile = "",
+    # When the script is launched from a copy outside OneDrive (see
+    # ensure_coding_voice.ps1), name the real project root explicitly:
+    # $PSScriptRoot would otherwise point at the copy's folder.
+    [string]$ProjectRoot = "",
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$PyArgs
 )
@@ -40,7 +44,9 @@ $prevLog = [IO.Path]::ChangeExtension($LogFile, ".prev.log")
 $errLog = [IO.Path]::ChangeExtension($LogFile, ".err.log")
 $prevErrLog = [IO.Path]::ChangeExtension($prevLog, ".prev.err.log")
 $stateFile = Join-Path $logDir "coding_voice.state"
-$projectRoot = Split-Path $PSScriptRoot -Parent   # this file sits in voice_stack\
+# this file sits in voice_stack\; when launched from a TEMP copy the caller
+# passes the real root via -ProjectRoot (PSScriptRoot would be the TEMP dir).
+$projectRoot = if ($ProjectRoot) { $ProjectRoot } else { Split-Path $PSScriptRoot -Parent }
 
 function LogSup($msg) {
     $line = "{0} supervisor: {1}" -f (Get-Date -Format "HH:mm:ss"), $msg

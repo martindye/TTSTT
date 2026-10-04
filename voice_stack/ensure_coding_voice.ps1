@@ -130,12 +130,16 @@ if ($bridgeAlive) {
         Fail "old bridge (pid $bridgePid) would not die - not starting a second one"
     }
 } elseif (-not $state) {
-    # Legacy stack (older supervisor wrote no state file): no other python
-    # is expected to be running; kill whatever python is the bridge.
-    $py = @(Get-Process python -ErrorAction SilentlyContinue)
+    # No state file: no bridge PID is recorded. Kill ONLY pythons that are
+    # actually this bridge (matched on the command line) — never every
+    # python on the box: the web speaker's TTS server and the TTS gate are
+    # resident pythons that must not be touched (03/10: the old "kill all
+    # python" branch took both of them down).
+    $py = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'voice_stack\.coding_voice' })
     if ($py.Count -gt 0) {
-        Say "NOTE: no state file found - stopping $($py.Count) python process(es)"
-        $py | Stop-Process -Force -ErrorAction SilentlyContinue
+        Say "NOTE: no state file found - stopping $($py.Count) bridge python process(es)"
+        $py | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Seconds 1
     }
 }
@@ -156,9 +160,17 @@ if (-not (Test-Path $SupScript)) { Fail "supervisor script missing: $SupScript" 
 Say "starting supervisor (workspace: $wsNorm)"
 # The supervisor prepends `-X utf8 -m voice_stack.coding_voice` itself;
 # pass ONLY the bridge options here (passing -m again makes argparse die).
+# Launch from a copy in %TEMP%: under the current WDAC/Intune policy,
+# `powershell -File` on a script under OneDrive hangs forever (03/10/2026:
+# the process stays alive but never executes a line). A copy outside
+# OneDrive starts normally. The copy gets the real project root via
+# -ProjectRoot, because its $PSScriptRoot is the TEMP dir.
+$projectRoot = Split-Path $PSScriptRoot -Parent
+$supCopy = Join-Path $env:TEMP "supervise_coding_voice.ps1"
+Copy-Item -Path $SupScript -Destination $supCopy -Force
 $extra = @($ExtraArgs | Where-Object { $_ })   # $null when no extras given
 $bridgeArgs = @("--workspace", $Workspace) + $extra
-$supArgs = @("-NoProfile", "-File", (Quote $SupScript)) +
+$supArgs = @("-NoProfile", "-File", (Quote $supCopy), "-ProjectRoot", (Quote $projectRoot)) +
     @($bridgeArgs | ForEach-Object { Quote $_ })
 Start-Process -FilePath "powershell" -ArgumentList $supArgs `
     -WindowStyle Hidden | Out-Null

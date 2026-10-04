@@ -12,6 +12,11 @@ real DSH session with a persona (`voice_persona/AGENTS.md`), tools, and the
 ability to hand coding work off to a full DSH coding agent that appears in the
 user's web GUI.
 
+Note (Sept 2026): the *coding voice* (the separate bridge that speaks the
+open coding chat's visible replies) has its own persona, transplanted and
+adapted to that flow, at the workspace root: `AGENTS.md`. The two personas
+serve different products; do not merge them.
+
 ## Key facts (do not re-derive)
 
 **LLM server**
@@ -77,6 +82,15 @@ user's web GUI.
   disabled (requests auto-reject — never attempt sandbox escalation).
 
 **Voices**
+- Current coding voice (2026-09-25): `--tts-engine qwen3gguf`, Qwen3 1.7B
+  VoiceDesign Q8 on the RTX 5090. `run_qwen3_voice.bat` selects it through
+  the existing supervisor. It uses complete-sentence WAV generation after
+  turn end (user explicitly declined streaming), plus voice/mood instructions.
+  Warm samples: 0.31–0.42 s synthesis for 2.85–3.43 s audio, with LLM and STT
+  resident; about 1.1 GiB GPU headroom. See QWEN_VOICE_DESIGN.md.
+  Its own hidden native server stays on localhost:8095 across bridge restarts;
+  `scripts/stop_qwen3_gguf.ps1` stops only that speech server. The user-managed
+  LLM on port 8080 was not changed. The old `qwen3tts` clone remains available.
 - Pocket TTS (CPU, INT4, thread-serialized). Default voice `eve` (female);
   catalog of predefined voices in `pocket_tts/utils/utils.py`
   (`_ORIGINS_OF_PREDEFINED_VOICES`); female: anna, vera, fantine, eponine,

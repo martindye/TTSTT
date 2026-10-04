@@ -1,0 +1,23 @@
+[
+  {
+    "mood": "sad",
+    "seed": 42,
+    "seconds": 0.61,
+    "audio_seconds": 6.72,
+    "sha256": "f5893f887e721c2164d2eba7acdb0a854b00e80959c55c511931108486243c93"
+  },
+  {
+    "mood": "quietly disappointed but trying to sound reassuring",
+    "seed": 42,
+    "seconds": 0.497,
+    "audio_seconds": 6.24,
+    "sha256": "0857d9b27fe529f8a27f8acd8eac219f3d3ad211d6ce4badcaa7c9c6b2bfb76f"
+  },
+  {
+    "mood": "sad",
+    "seed": 42,
+    "seconds": 0.548,
+    "audio_seconds": 6.72,
+    "sha256": "f5893f887e721c2164d2eba7acdb0a854b00e80959c55c511931108486243c93"
+  }
+]

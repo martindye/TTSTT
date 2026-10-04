@@ -33,5 +33,9 @@ def get(name: str):
     return next((e for e in _REGISTRY if e.name == name), None)
 
 
-# Engines register themselves on import.
+# Engines register themselves on import. Registration order sets the
+# server default (the first engine answers requests without an explicit
+# "engine"): qwen3ggufbase first, so the web speaker system speaks with
+# the Qwen3 1.7B voice model; pocket stays available as "pocket".
+from . import qwen3ggufbase  # noqa: E402,F401
 from . import pocket  # noqa: E402,F401

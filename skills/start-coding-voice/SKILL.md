@@ -65,6 +65,11 @@ Useful options (append to the command):
   full list (anna, vera, fantine, eponine, azelma, mary, jane, eve,
   cosette, caro_davy, alba, jean, charles, paul, george, michael, marius,
   javert, bill_boerst, peter_yearsley, stuart_bell, ...).
+- `--tts-engine <pocket|kyutai16b|qwen3tts>` — the TTS model. `pocket` (the
+  default above) is the small local model. The two BIG engines live on the
+  GPU and have their own skill (`start-coding-voice-pro`): `kyutai16b` is the
+  big Kyutai 1.6B with moods, `qwen3tts` is the Qwen3-TTS 0.6B voice-clone
+  (slower — it generates each whole sentence before it can play it).
 - `--utterance-max <seconds>` — how long the user may keep talking before
   their utterance is sent anyway (default 120 = two minutes).
 - `--final-silence <seconds>` — real silence required after a full stop
@@ -95,12 +100,24 @@ follows ONE workspace at a time (auto-following between its sessions), so
 there is no "go back": the next `/start-coding-voice` from any chat just
 re-aims it again.
 
-## Stop
+## Stop — one command, idempotent (no thinking)
 
-Create the stop sentinel FIRST (so the supervisor does not restart the
-bridge), then kill the bridge by the PID the supervisor recorded in
-`coding_voice.state` (no WMI needed; only if that file is absent — a legacy
-stack — kill any `python`):
+This is the target of the spoken commands "stop speech" / "voice off":
+
+    powershell -NoProfile -File {{TTSTT_ROOT}}\voice_stack\stop_coding_voice.ps1
+
+It sets the stop sentinel FIRST (so the supervisor cannot restart the
+bridge), kills the bridge (PID from `coding_voice.state`, else by command
+line — never blind at-all-python), waits for the supervisor to notice and
+exit (force-killing it if stuck), removes the state file, and verifies
+nothing voice-related is left. Safe to run when nothing is running. Exit 0
+= stopped and verified; report that in one line. Exit 1 = a voice python
+survived; report it, do not loop.
+
+Manual fallback (only if the script is missing): create the stop sentinel
+FIRST (so the supervisor does not restart the bridge), then kill the bridge
+by the PID the supervisor recorded in `coding_voice.state` (no WMI needed;
+only if that file is absent — a legacy stack — kill any `python`):
 
     New-Item {{DASHOME}}\logs\coding_voice.STOP -ItemType File -Force
     $s = $null
@@ -144,16 +161,25 @@ removes the sentinel and its state file itself when it exits).
   agent). The mic is closed while reply audio is in the air (echo guard)
   and open in the gaps (between sentences, tool calls); anything the user
   says in a gap goes to a mailbox (ring buffer), and when the turn ends the
-  most recent 60 s of it is transcribed and sent, so nothing recent is lost
+  most recent 60 s of it is transcribed and sent
   without replaying minutes of old audio.
 - Utterance ending is lenient: a sentence ending in . ! ? sends only after
-  `--final-silence` s of real silence (default 3 — the STT drops a full stop
-  on any pause, so a bare full stop never sends on its own); an unpunctuated
-  short utterance (3-12 words, a command) sends only after 6 s of real
-  silence; fragments shorter than 3 words are never sent on their own — they
+  `--final-silence` s without a recognised word (default 3); an unpunctuated
+  utterance of at least 3 words sends after 6 s without a word. Both paths
+  wait while more than two captured audio frames are queued, so recognition
+  backlog is not mistaken for a finished sentence. Short fragments
   merge with whatever the user says next. Everything else holds the door open
   until `--utterance-max` (default 2 minutes).
 - The bridge also speaks replies triggered any other way (typed in the GUI,
   handoffs) — everything the window shows is spoken. That is by design.
 - Logs: {{DASHOME}}\logs\coding_voice.log. Session events are only
   consumed; the gateway is never restarted by this bridge.
+- If the process is alive but hears nothing, check the Windows input mute
+  state as well as decoder logs. A muted Blue Snowflake still delivers
+  frames containing near-zero samples; process heartbeats do not establish
+  that it can hear speech. Never automatically unmute on every launch.
+- The decoder gets fresh streaming caches after a reply, on its own worker
+  thread. After fifteen seconds of processed audio without words it resets
+  again and retries up to fifteen seconds of unheard audio if it contains
+  sound. This does not reload weights or restart DSH; already recognised
+  words are excluded from retry. Endpointing waits for retry to finish.

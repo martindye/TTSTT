@@ -22,6 +22,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
+from contextlib import ExitStack
 
 import torch
 
@@ -75,12 +76,9 @@ class KyutaiSTT:
         self.delay_tokens = int(
             round(float(self.stt_config.get("audio_delay_seconds", 0.5)) * self.frame_rate)
         )
-        self.mimi.streaming_forever(1)
-        self.lm_gen.streaming_forever(1)
-        self._primed = False
-        self._step_idx = 0
         self.total_frames = 0
-        self._warmup()
+        self._streams = ExitStack()
+        self.reset()
 
     def _warmup(self):
         """Run two silent frames so lazy compilation / CUDA-graph capture happens
@@ -99,23 +97,19 @@ class KyutaiSTT:
 
     # ----------------------------------------------------------------- reset
     def reset(self):
-        """Reset LM streaming state (offsets + KV) and the mimi exec mask.
+        """Recreate streaming caches/graphs, retaining the loaded weights.
 
-        Note: the mimi SEANet conv buffers retain a few frames of history; that
-        is harmless because silence follows between turns. Use for recovery or
-        to start from a clean context.
+        Offset-only resets retain convolution history and cache contents;
+        they cannot reliably repair poisoned decoder state. Call only from
+        the feed thread (or before it starts). Fail visibly if reset fails.
         """
-        reset_mask = torch.ones(1, dtype=torch.bool, device=self.device)
-        try:
-            self.lm_gen.reset_streaming(reset_mask)
-        except Exception:
-            log.exception("STT LM reset failed; continuing")
-        try:
-            self.mimi.reset_streaming(reset_mask)
-        except Exception:
-            log.exception("STT mimi reset failed; continuing")
+        self._streams.close()
+        self._streams = ExitStack()
+        self._streams.enter_context(self.mimi.streaming(1))
+        self._streams.enter_context(self.lm_gen.streaming(1))
         self._primed = False
         self._step_idx = 0
+        self._warmup()
 
     # ------------------------------------------------------------- inference
     def feed_frame(self, pcm: torch.Tensor) -> list[SttEvent]:
@@ -147,4 +141,4 @@ class KyutaiSTT:
         return [SttEvent(SttEventKind.WORD, piece=piece)]
 
     def close(self):
-        pass
+        self._streams.close()

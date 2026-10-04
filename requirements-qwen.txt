@@ -1,0 +1,4 @@
+# Optional Qwen voices; installed runtime used for adapter validation.
+# requirements.txt is the older Pocket/Kyutai baseline. Do not reinstall its
+# transformers pin over the Qwen runtime; resolve these in an isolated env.
+qwen-tts==0.1.1

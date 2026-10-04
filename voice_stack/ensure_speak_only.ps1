@@ -123,9 +123,16 @@ if (-not (Test-Path $SupScript)) { Fail "supervisor script missing: $SupScript" 
 Say "starting speak-only supervisor (workspace: $wsNorm)"
 # The supervisor prepends `-X utf8 -m voice_stack.speak_only` itself; pass
 # ONLY the bridge options here (passing -m again makes argparse die).
+# Launch from a copy in %TEMP%: under the current WDAC/Intune policy,
+# `powershell -File` on a script under OneDrive hangs forever (03/10/2026:
+# the process stays alive but never executes a line). A copy outside
+# OneDrive starts normally; it gets the real root via -ProjectRoot.
+$projectRoot = Split-Path $PSScriptRoot -Parent
+$supCopy = Join-Path $env:TEMP "supervise_speak_only.ps1"
+Copy-Item -Path $SupScript -Destination $supCopy -Force
 $extra = @($ExtraArgs | Where-Object { $_ })   # $null when no extras given
 $bridgeArgs = @("--workspace", $Workspace) + $extra
-$supArgs = @("-NoProfile", "-File", (Quote $SupScript)) +
+$supArgs = @("-NoProfile", "-File", (Quote $supCopy), "-ProjectRoot", (Quote $projectRoot)) +
     @($bridgeArgs | ForEach-Object { Quote $_ })
 Start-Process -FilePath "powershell" -ArgumentList $supArgs `
     -WindowStyle Hidden | Out-Null

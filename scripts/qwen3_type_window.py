@@ -1,29 +1,9 @@
-"""Type-to-speak window for the Qwen3-TTS voices.
+"""Test the local GPU Q8 build of Qwen3-TTS-12Hz-1.7B-VoiceDesign.
 
-Two GGUF engines share port 8095, one at a time:
-
-* Base Q8 (the clone engine) - speaks with the registered reference
-  voices: pocket (the recently cloned coding voice), warm-brit and
-  p277. The Base model takes no style instructions, so the emotion
-  box is disabled for these voices.
-* VoiceDesign Q8 (the designed voice) - a text-described voice that
-  honours the emotion box: a bare mood word like "fear" expands to a
-  tone line appended to the fixed identity; an empty box
-  falls back to the default identity.
-
-Switching between the two engines stops the running server (only when
-this window started it) and starts the other, which takes about a
-minute. The server this window started is stopped again when the
-window closes, freeing the GPU.
-
-A third engine lives on its own port 8096: the C engine (qwen3-tts)
-running in WSL2, serving the warm British voice as a cloned .qvoice that
-emotes - the emotion box takes a mood word; the six base emotions are
-voiced and anything else falls back to plain speech. The window wakes
-it from WSL on demand and never stops it when it closes.
-
-The designed voice is the window's standard (first and default); a
-seed box next to the emotion box fixes the take (42 unless changed).
+Sends the complete passage with the user instruction unchanged and an explicit seed. No sentence splitting or streaming.
+The window preserves the draft and settings on close. It verifies the serving
+model alias before sending speech. VoiceDesign designs voices; it does not clone
+an audio reference. Older engine helpers remain for compatibility only.
 """
 from __future__ import annotations
 
@@ -63,7 +43,7 @@ STOP_SCRIPT = ROOT / "scripts" / "stop_qwen3_gguf.ps1"
 BASE_STATE = ROOT / "tests" / "qwen3_gguf_base_server.json"
 DESIGN_STATE = ROOT / "tests" / "qwen3_gguf_server.json"
 
-DESIGNED = "designed (takes emotion)"
+DESIGNED = "Qwen3 1.7B VoiceDesign Q8"
 C_EMOTING = "British female (emoting clone)"
 WINDOW_STATE = ROOT / "tests" / "voice_window_state.json"
 REFERENCE_AUDIO = ROOT / "voice_stack" / "ref_voices" / "british_p225.wav"
@@ -72,46 +52,11 @@ REFERENCE_AUDIO = ROOT / "voice_stack" / "ref_voices" / "british_p225.wav"
 # window's standard: it is first in the list and the default selection.
 VOICES = {
     DESIGNED: ("design", None),
-    C_EMOTING: ("c", None),
-    "pocket (cloned)": ("base", "pocket"),
-    "warm-brit (cloned)": ("base", "warm-brit"),
-    "p277 (cloned)": ("base", "p277"),
 }
-
-MOOD_LINES = {
-    "adoration": "Speak in an adoring, tender tone, full of warmth and affection.",
-    "anger": "Speak with a sharp, irritated edge, words clipped and tense.",
-    "anxiety": "Speak with a nervous, anxious tension, as if something may go wrong at any moment.",
-    "amusement": "Speak with a playful, amused smile in your voice, lightly teasing.",
-    "comfort": "Speak in a soft, soothing, reassuring tone, as if calming someone down.",
-    "contempt": "Speak with a cool, dismissive tone, a hint of disdain in every word.",
-    "contentment": "Speak in a calm, satisfied tone, relaxed and at ease.",
-    "curiosity": "Speak with bright, curious interest, leaning in as you speak.",
-    "despair": "Speak in a heavy, broken voice, drained of hope.",
-    "determination": "Speak with a firm, resolute edge, steady and unshakable.",
-    "disappointment": "Speak with a deflated, let-down tone, as if a hope just slipped away.",
-    "excitement": "Speak with an excited, buzzing energy, quick and eager.",
-    "fear": "Speak in a frightened, fearful tone, with tension and a hint of panic creeping into your voice.",
-    "grief": "Speak in a heavy, grieving voice, slow and aching.",
-    "guilt": "Speak with a low, remorseful weight, as if carrying a sorry you cannot undo.",
-    "joy": "Speak with a bright, joyful warmth, as if the news genuinely delights you.",
-    "love": "Speak in a soft, loving, devoted tone, gentle and intimate.",
-    "nervousness": "Speak with a slightly shaky, self-conscious tension, pausing as if unsure.",
-    "nostalgia": "Speak with a wistful, tender tone, as if recalling a dear memory.",
-    "pride": "Speak with a warm, satisfied confidence, quietly pleased with what you are saying.",
-    "sadness": "Speak in a low, sorrowful tone, heavy and slow.",
-    "shock": "Speak with a startled, wide-eyed tone, as if the news just landed.",
-    "surprise": "Speak with a quick, surprised lift, as if you did not expect this at all.",
-    "serenity": "Speak in a calm, peaceful tone, unhurried and at rest.",
-}
-
 
 def build_instruction(emotion: str) -> str:
-    """Emotion box content -> full instruction for the designed voice."""
-    em = emotion.strip()
-    if not em:
-        return DEFAULT_INSTRUCT
-    return DEFAULT_INSTRUCT + " " + MOOD_LINES.get(em.lower(), em)
+    """Forward the user's instruction verbatim to VoiceDesign."""
+    return emotion
 
 
 # Names the C engine accepts directly, so free text in the emotion box
@@ -158,7 +103,7 @@ def split_sentences(text: str) -> list:
 class VoiceWindow:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        root.title("TTSTT - type to speak (British voice, revision 3)")
+        root.title("TTSTT - Qwen3 VoiceDesign (revision 6)")
 
         self.busy = False
         self.closed = False
@@ -174,7 +119,7 @@ class VoiceWindow:
         self.voice_combo.pack(side="left", padx=(6, 14), ipady=2)
         self.voice_combo.bind("<<ComboboxSelected>>",
                               lambda _e: self._voice_changed())
-        tk.Label(top, text="Emotion (optional):").pack(side="left")
+        tk.Label(top, text="Voice / emotion instruction:").pack(side="left")
         self.emotion = tk.Entry(top, width=20)
         self.emotion.pack(side="left", padx=(4, 0), ipady=2)
         self.emotion.config(state="normal")
@@ -182,16 +127,8 @@ class VoiceWindow:
         self.seed = tk.Entry(top, width=8)
         self.seed.insert(0, "42")
         self.seed.pack(side="left", padx=(4, 0), ipady=2)
-
         hint = (tk.Label(root, fg="gray", wraplength=740,
-                         text="emotion: the designed voice takes any mood word or "
-                              "line; the emoting clone takes any mood word too - "
-                              "six are voiced (sad, joy, anger, fear, disgust, "
-                              "surprise), the rest speak plainly; the plain "
-                              "clones ignore it. Clone emotions are "
-                              "approximate. Seed: same text with the same "
-                              "seed sounds the same; change it for a "
-                              "different take."))
+                         text="Your instruction is sent unchanged to VoiceDesign. The full passage is generated together."))
         hint.pack(anchor="w", padx=14)
         self.text = tk.Text(root, wrap="word", height=7, font=("Segoe UI", 12))
         self.text.pack(fill="both", expand=True, padx=10, pady=(4, 4))
@@ -205,12 +142,6 @@ class VoiceWindow:
         self.stop_btn = tk.Button(bottom, text="Stop", command=self.stop,
                                   state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
-        self.reference_btn = tk.Button(bottom, text="Hear British reference",
-                                       command=self.play_reference)
-        self.reference_btn.pack(side="left", padx=8)
-        self.preview_btn = tk.Button(bottom, text="Test one sentence",
-            command=lambda: self.speak("Hello, Martin. Shall we try that again?"))
-        self.preview_btn.pack(side="left", padx=4)
         self.status_var = tk.StringVar(
             value="Ready - the voice server loads on the first Speak (about a minute).")
         tk.Label(root, textvariable=self.status_var, wraplength=740).pack(fill="x", padx=10, pady=4)
@@ -268,11 +199,11 @@ class VoiceWindow:
             "seed": self.seed.get()}, ensure_ascii=False), encoding="utf-8")
 
     def _seed(self) -> int:
-        """The seed box as an int; 42 when blank or not a number."""
-        try:
-            return int(self.seed.get().strip())
-        except ValueError:
-            return 42
+        """Reject the random-seed sentinel and accidental invalid input."""
+        seed = int(self.seed.get().strip() or "42")
+        if not 0 <= seed <= 4294967295:
+            raise ValueError("Seed must be between 0 and 4294967295; use 42 for repeatable tests.")
+        return seed
 
     def speak(self, text_override: str | None = None) -> None:
         if self.busy:
@@ -288,15 +219,20 @@ class VoiceWindow:
             return
         emotion = (self.emotion.get()
                    if engine in ("design", "c") else "")
-        seed = self._seed()
+        if not emotion.strip():
+            self._status("Enter a voice or emotion instruction first.")
+            return
+        try:
+            seed = self._seed()
+        except ValueError:
+            self._status("Enter a seed from 0 to 4294967295. Use 42 for repeatable tests.")
+            return
         self.busy = True
         self._save_state()
         sd.stop()
         self.cancel.clear()
         self.speak_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.reference_btn.config(state="disabled")
-        self.preview_btn.config(state="disabled")
         self.voice_combo.config(state="disabled")
         self.emotion.config(state="disabled")
         self.seed.config(state="disabled")
@@ -327,12 +263,13 @@ class VoiceWindow:
                 return
             instruction = (build_instruction(emotion)
                            if engine == "design" else None)
-            sentences = split_sentences(text)
+            sentences = [text]
             total = len(sentences)
             for i, sentence in enumerate(sentences, 1):
                 if self.cancel.is_set():
                     break
-                self._status(f"Speaking {i} of {total}...")
+                self._status(f"Generating VoiceDesign; seed {seed}; emotion: {emotion or 'neutral'}...")
+                started = time.perf_counter()
                 payload = {
                     "model": (DESIGN_ALIAS if engine == "design"
                               else BASE_ALIAS),
@@ -349,13 +286,17 @@ class VoiceWindow:
                 r = requests.post(SPEECH_URL, json=payload,
                                   timeout=(5, 180))
                 r.raise_for_status()
+                elapsed = time.perf_counter() - started
+                (ROOT / "tests" / "voice_window_last_request.json").write_text(
+                    json.dumps({"url": SPEECH_URL, "payload": payload,
+                                "generation_seconds": elapsed}, indent=2), encoding="utf-8")
                 audio, rate = sf.read(io.BytesIO(r.content), dtype="float32")
                 if self.cancel.is_set():
                     break
                 sd.play(audio, rate)
                 sd.wait()
             if not self.cancel.is_set():
-                self._finish("Done.")
+                self._finish(f"Done: VoiceDesign; seed {seed}; generated in {elapsed:.1f}s.")
         except Exception as exc:
             self._status(f"Error while speaking: {exc}")
         finally:
@@ -446,8 +387,6 @@ class VoiceWindow:
             self.busy = False
             self.speak_btn.config(state="normal")
             self.stop_btn.config(state="disabled")
-            self.reference_btn.config(state="normal")
-            self.preview_btn.config(state="normal")
             self.voice_combo.config(state="readonly")
             self.seed.config(state="normal")
             self._voice_changed()

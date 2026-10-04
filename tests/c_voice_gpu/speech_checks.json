@@ -1,0 +1,34 @@
+[
+  {
+    "file": "0_neutral.wav",
+    "emotion": "neutral",
+    "seed": 42,
+    "generation_seconds": 3.752,
+    "audio_seconds": 3.36,
+    "sha256": "6f7992aea67d69c92f96c83ffae07c2ebd60a807b4305d8cb9c8aae9df734ff3"
+  },
+  {
+    "file": "1_joy.wav",
+    "emotion": "joy",
+    "seed": 42,
+    "generation_seconds": 3.571,
+    "audio_seconds": 3.52,
+    "sha256": "15f861894eef4c0072d95b76a0ea97a9a06762effef2af64066f767e92400415"
+  },
+  {
+    "file": "2_sad.wav",
+    "emotion": "sad",
+    "seed": 42,
+    "generation_seconds": 3.617,
+    "audio_seconds": 4.0,
+    "sha256": "1cbf8028bb82b789cd492f5bed448dbce6bd4aa918c5a1b4cc980c55bcb04e9e"
+  },
+  {
+    "file": "3_joy.wav",
+    "emotion": "joy",
+    "seed": 42,
+    "generation_seconds": 3.417,
+    "audio_seconds": 3.52,
+    "sha256": "15f861894eef4c0072d95b76a0ea97a9a06762effef2af64066f767e92400415"
+  }
+]

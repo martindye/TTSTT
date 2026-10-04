@@ -14,6 +14,9 @@
 
 param(
     [string]$LogFile = "",
+    # When launched from a copy outside OneDrive (see ensure_speak_only.ps1),
+    # name the real project root: $PSScriptRoot would be the copy's folder.
+    [string]$ProjectRoot = "",
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$PyArgs
 )
@@ -35,7 +38,8 @@ $prevLog    = [IO.Path]::ChangeExtension($LogFile, ".prev.log")
 $errLog     = [IO.Path]::ChangeExtension($LogFile, ".err.log")
 $prevErrLog = [IO.Path]::ChangeExtension($prevLog, ".prev.err.log")
 $stateFile  = Join-Path $logDir "speak_only.state"
-$projectRoot = Split-Path $PSScriptRoot -Parent   # this file sits in voice_stack\
+# this file sits in voice_stack\; a TEMP copy gets the real root via -ProjectRoot
+$projectRoot = if ($ProjectRoot) { $ProjectRoot } else { Split-Path $PSScriptRoot -Parent }
 
 function LogSup($msg) {
     $line = "{0} speak-only supervisor: {1}" -f (Get-Date -Format "HH:mm:ss"), $msg

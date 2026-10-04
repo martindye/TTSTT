@@ -476,10 +476,28 @@ def make_stt(repo: str, device: str) -> KyutaiSTT:
     raise RuntimeError(f"could not load STT: {last_err}")
 
 
-def make_tts(language: str = "english", voice: str = "alba", quantize: bool = True):
+def make_tts(language: str = "english", voice: str = "alba", quantize: bool = True,
+             *, engine="pocket", model_dir=None, instruct=None, device="cuda:0"):
+    if engine == "qwen3gguf":
+        from .qwen3_gguf_engine import Qwen3GGUF, DEFAULT_INSTRUCT
+        return Qwen3GGUF(instruct=instruct if instruct is not None else DEFAULT_INSTRUCT,
+                         language=language)
+    if engine == "qwen3design":
+        from .qwen3_design_engine import Qwen3VoiceDesign, DEFAULT_INSTRUCT
+        return Qwen3VoiceDesign(model_dir=model_dir,
+                               instruct=instruct if instruct is not None else DEFAULT_INSTRUCT,
+                               language=language, device=device)
+    if engine != "pocket":
+        raise ValueError(f"Unknown TTS engine: {engine}")
     from .tts_engine import TTSEngine
 
     return TTSEngine(language=language, voice=voice, quantize=quantize)
+
+
+def make_tts_from_args(args):
+    return make_tts(args.tts_language, args.tts_voice, args.tts_quantize,
+                    engine=args.tts_engine, model_dir=args.qwen3tts_model,
+                    instruct=args.qwen3tts_instruct, device=args.qwen3tts_device)
 
 
 def make_runtime(args, persona: Path) -> DshRuntime:
@@ -515,7 +533,7 @@ class _MutedSpeakers:
 
 
 def run_once(args, text: str) -> int:
-    tts = make_tts(args.tts_language, args.tts_voice, args.tts_quantize)
+    tts = make_tts_from_args(args)
     runtime = make_runtime(args, DEFAULT_PERSONA)
     muted = bool(getattr(args, "no_speak", False))
     if muted:
@@ -560,7 +578,7 @@ def run_once(args, text: str) -> int:
 
 def run_live(args) -> int:
     stt = make_stt(args.stt_repo, args.stt_device)
-    tts = make_tts(args.tts_language, args.tts_voice, args.tts_quantize)
+    tts = make_tts_from_args(args)
     runtime = make_runtime(args, DEFAULT_PERSONA)
     runtime.start()
 
@@ -602,6 +620,10 @@ def parse_args(argv=None):
     p.add_argument("--stt-repo", default="kyutai/stt-1b-en_fr")
     p.add_argument("--stt-device", default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--tts-language", default="english")
+    p.add_argument("--tts-engine", choices=["pocket", "qwen3design", "qwen3gguf"], default="pocket")
+    p.add_argument("--qwen3tts-model", default=None, help="local VoiceDesign directory")
+    from .qwen3_design_engine import add_design_arguments
+    add_design_arguments(p)
     p.add_argument("--tts-voice", default="eve")
     p.add_argument("--tts-quantize", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("-v", "--verbose", action="store_true")

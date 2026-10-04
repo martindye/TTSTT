@@ -1,0 +1,98 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CosyVoice 3 playground</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#0d1117; color:#e6edf3; font:15px/1.5 ui-sans-serif, system-ui, sans-serif; max-width:760px; margin:2.5rem auto; padding:0 1rem; }
+  h1 { font-size:1.25rem; margin-bottom:.25rem; }
+  .sub { color:#8b949e; font-size:.85rem; margin-bottom:1.25rem; }
+  textarea { width:100%; box-sizing:border-box; background:#161b22; color:#e6edf3; border:1px solid #30363d; border-radius:8px; padding:.6rem .7rem; font:inherit; resize:vertical; min-height:76px; }
+  .row { display:flex; gap:.6rem; margin-top:.8rem; flex-wrap:wrap; align-items:center; }
+  select, input[type=text] { background:#161b22; color:#e6edf3; border:1px solid #30363d; border-radius:8px; padding:.5rem .6rem; font:inherit; }
+  input[type=text] { flex:1; min-width:200px; }
+  button { background:#238636; color:#fff; border:0; border-radius:8px; padding:.55rem 1.3rem; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { background:#21262d; color:#8b949e; cursor:wait; }
+  .chips { margin-top:.7rem; display:flex; gap:.4rem; flex-wrap:wrap; }
+  .chip { background:#21262d; border:1px solid #30363d; color:#c9d1d9; border-radius:999px; padding:.25rem .8rem; font-size:.85rem; cursor:pointer; }
+  .chip:hover { border-color:#58a6ff; }
+  .hint { color:#8b949e; font-size:.82rem; margin-top:.9rem; }
+  code { background:#161b22; padding:.1rem .35rem; border-radius:4px; font-size:.92em; }
+  audio { display:block; margin-top:.9rem; width:100%; }
+  #status { margin-top:.5rem; font-size:.85rem; color:#8b949e; min-height:1.2em; }
+  .err { color:#f85149; }
+  a.dl { color:#58a6ff; font-size:.85rem; }
+</style>
+</head>
+<body>
+<h1>CosyVoice 3 playground</h1>
+<div class="sub">Type below and hit Play. Straight to the live 8097 engine, no gate in between.</div>
+<textarea id="text">Right then. [breath] The new voice is in the slot. And <strong>that</strong> is the emphasised bit. [laughter] Fancy, eh?</textarea>
+<div class="row">
+  <select id="voice"></select>
+  <input type="text" id="style" placeholder="emotion instruction, e.g. say this in a very happy tone (optional)">
+  <button id="go">Play</button>
+</div>
+<div class="chips">
+  <span class="chip" data-s="Say this in a British English accent.">British</span>
+  <span class="chip" data-s="Say this in a very happy, excited tone.">Happy</span>
+  <span class="chip" data-s="Say this in a calm, reassuring tone.">Calm</span>
+  <span class="chip" data-s="Say this in a sad, disappointed tone.">Sad</span>
+  <span class="chip" data-s="Say this in an angry, furious tone.">Angry</span>
+  <span class="chip" data-s="Say this in a quiet, whispering tone.">Whisper</span>
+  <span class="chip" data-s="">Clear</span>
+</div>
+<div class="hint">
+  In-text tokens: <code>[breath]</code> <code>[sigh]</code> <code>[laughter]</code> <code>[cough]</code>
+  <code>[hissing]</code> <code>[mn]</code> and <code>&lt;strong&gt;emphasis&lt;/strong&gt;.</code>
+  Phonemes (no stress digits &mdash; the text normaliser mangles them): <code>[JH][IY]</code> says J, <code>[B][IY]</code> says B.
+</div>
+<div id="status"></div>
+<audio id="player" controls style="display:none"></audio>
+<a class="dl" id="dl" href="#" style="display:none" download="take.wav">Save last take as WAV</a>
+<script>
+  var $ = function (id) { return document.getElementById(id); };
+  var voiceSel = $("voice"), style = $("style"), go = $("go"), status = $("status"), player = $("player"), dl = $("dl");
+  fetch("/v1/audio/voices").then(function (r) { return r.json(); }).then(function (j) {
+    voiceSel.innerHTML = "";
+    j.voices.forEach(function (v) {
+      var o = document.createElement("option");
+      o.value = o.textContent = v.name;
+      voiceSel.appendChild(o);
+    });
+  }).catch(function () { voiceSel.innerHTML = "<option>pocket</option>"; });
+  document.querySelectorAll(".chip").forEach(function (c) {
+    c.addEventListener("click", function () { style.value = c.getAttribute("data-s"); });
+  });
+  go.addEventListener("click", function () {
+    var text = $("text").value.trim();
+    if (!text) return;
+    go.disabled = true;
+    status.className = "";
+    status.textContent = "thinking...";
+    var body = { model: "ttstt-qwen3-base-q8", input: text, voice: voiceSel.value || "pocket", response_format: "wav" };
+    if (style.value.trim()) body.style = style.value.trim();
+    var t0 = performance.now();
+    fetch("/v1/audio/speech", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || r.status); });
+        return r.blob();
+      })
+      .then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        if (player.src) URL.revokeObjectURL(player.src);
+        player.src = url;
+        player.style.display = "block";
+        player.play();
+        dl.href = url;
+        dl.style.display = "inline";
+        status.textContent = "done in " + ((performance.now() - t0) / 1000).toFixed(1) + "s";
+      })
+      .catch(function (e) { status.textContent = "error: " + e.message; status.className = "err"; })
+      .then(function () { go.disabled = false; });
+  });
+</script>
+</body>
+</html>

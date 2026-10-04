@@ -18,3 +18,9 @@ tests/*.txt
 tests/*.wav
 tests/*.json
 tests/*.err
+
+# Regenerable A/B sample audio (bakes from the trial scripts)
+samples/
+
+# Throwaway probe/bench scripts
+scripts/tmp-*.py

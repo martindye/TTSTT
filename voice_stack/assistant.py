@@ -47,6 +47,11 @@ def split_sentence(buf: str) -> tuple[str, str]:
     A sentence ends at the first ". ", "! " or "? " (or at a terminal
     [.!?] when nothing else follows). Returns ("", buf) while no boundary
     has been seen yet.
+
+    A terminal dot after a digit is NOT a boundary: it may be a decimal
+    point whose digits are still streaming in ("...is 1." + "5"), or part
+    of an IP / version ("127.0.0.1"). Hold it in the buffer; the next
+    delta (or the end-of-block flush) resolves it.
     """
     idx = -1
     for pat in (". ", "! ", "? "):
@@ -60,6 +65,8 @@ def split_sentence(buf: str) -> tuple[str, str]:
             i -= 1
         if i > 0 and i == len(buf):
             idx = i - 1
+            if idx > 0 and buf[idx - 1].isdigit():
+                idx = -1  # decimal / IP / version: hold for more digits
     if idx == -1:
         return "", buf
     return buf[: idx + 1], buf[idx + 1 :].lstrip()

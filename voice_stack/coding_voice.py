@@ -115,9 +115,13 @@ def _free_vram_bytes() -> int | None:
 VOICE_TAIL_S = 1.0
 
 # At turn end at most this much of the mailbox is transcribed (anything
-# older is dropped). 3 min (Martin, Oct 2026): long turns can no longer
-# eat the speaker's words. The ring itself holds 5 min.
-MAX_MAIL_DRAIN_S = 180.0
+# older is dropped). History: 3 min (Oct 2026, so long turns can't eat his
+# words) -> 30 s (17 Jul 2026: a 32 s drain backed the STT up ~2 min) ->
+# 60 s (26 Sep 2026: a question asked ~30 s before a turn's end fell just
+# outside the 30 s window and was lost). At ~19 ms/frame a 60 s drain is
+# ~15 s of STT work, so the late-arrival risk stays bounded. The ring holds
+# 5 min.
+MAX_MAIL_DRAIN_S = 60.0
 FRAME_S = 0.08
 
 # Cycle the follow stream this often (server idle-closes at ~75 s).
@@ -131,9 +135,34 @@ FLOOR_MAX_S = 240.0     # absolute backstop; normal release is turn-end +
 
 FLOOR_LOG_ONCE = True
 
+# Mic/STT diagnostics (added after the 18:05 silent drop): the mic path used
+# to log nothing, so a lost utterance left no trace at all. _mic_watcher
+# reports the two failure signatures instead; the normal case stays silent.
+MIC_SILENCE_ALARM_S = 10.0   # no mic frames arriving for this long
+STT_BLIND_ALARM_S = 20.0     # speech-level audio in, no STT words, this long
+STT_BLIND_RMS = 0.01         # running mic RMS that counts as "someone is talking"
+# Bound wordless decoder state without requiring uninterrupted speech.
+STT_RECOVERY_S = 15.0  # processed audio without a word, even across pauses
+STT_REPLAY_S = 15.0   # retain unheard audio for one retry after reset
+
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%H:%M:%S')} {LOG_PREFIX} {msg}", flush=True)
+
+
+class _NoopTTS:
+    """TTS-off stand-in: no local model, no local audio.
+
+    The reply is spoken by the web speaker system (dsh-voice-output plugin
+    -> voice_stack.tts_server -> the device's speaker), never on this
+    machine. The bridge keeps STT + chat injection; nothing is owed to a
+    local speaker, so the floor releases as soon as the turn ends.
+    """
+
+    sample_rate = 24000
+
+    def stream_sentence(self, sentence, stop_event=None):
+        return iter(())
 
 
 def _make_bridge_tts(args):
@@ -151,8 +180,51 @@ def _make_bridge_tts(args):
     vctk/p277_023. If the big model fails to load for any reason, fall
     back to the pocket model so the bridge still starts.
     """
+    if args.tts_engine == "none":
+        log("TTS: off - the web speaker system speaks the replies "
+            "(dsh-voice-output -> tts_server), not this machine")
+        return _NoopTTS(), False
     quantize = args.tts_quantize != "none"
     moods_choice = getattr(args, "tts_moods", None)
+    if args.tts_engine == "qwen3gguf":
+        from .qwen3_gguf_engine import Qwen3GGUF
+        log("TTS: Qwen3 VoiceDesign 1.7B Q8 on GPU, complete sentences")
+        tts = Qwen3GGUF(instruct=args.qwen3tts_instruct,
+                        language=args.tts_language, moods=moods_choice != "off")
+        return tts, True
+    if args.tts_engine == "qwen3ggufbase":
+        from .qwen3_gguf_base_engine import Qwen3GGUFBase
+        log("TTS: Qwen3 Base 1.7B Q8 on GPU, fixed reference voice (pocket)")
+        tts = Qwen3GGUFBase(voice="pocket")
+        return tts, True
+    if args.tts_engine == "qwen3design":
+        from .qwen3_design_engine import Qwen3VoiceDesign
+        log("TTS: loading Qwen3 VoiceDesign 1.7B with expression controls "
+            "(whole-sentence generation)")
+        # Fail visibly if this explicitly selected voice cannot load.
+        tts = Qwen3VoiceDesign(
+            model_dir=args.qwen3tts_model, instruct=args.qwen3tts_instruct,
+            language=args.tts_language, moods=moods_choice != "off",
+            device=args.qwen3tts_device)
+        log(f"TTS: Qwen3 VoiceDesign ready ({tts.sample_rate} Hz)")
+        return tts, True
+    if args.tts_engine == "qwen3tts":
+        if moods_choice is not None:
+            log("TTS: the Qwen3 engine has no moods; --tts-moods ignored")
+        log("TTS: loading Qwen3-TTS 0.6B (bf16 on the GPU, voice clone of "
+            "the pro clip) - first load can take a minute...")
+        try:
+            from .qwen3_tts_engine import Qwen3TTS
+            tts = Qwen3TTS(model_dir=args.qwen3tts_model or None,
+                           ref_audio=args.qwen3tts_ref or None)
+            log(f"TTS: Qwen3-TTS ready ({tts.sample_rate} Hz)")
+            return tts, True
+        except Exception:
+            import traceback
+            log("TTS: Qwen3-TTS failed to load - "
+                "falling back to the pocket TTS")
+            traceback.print_exc()
+            return make_tts(args.tts_language, args.tts_voice, quantize), False
     if args.tts_engine != "kyutai16b":
         if moods_choice is not None:
             log("TTS: --tts-moods needs the Pro engine; "
@@ -671,7 +743,17 @@ class CodingVoice:
         self._primed = False
         self._primed_for: str | None = None
         self.spoken = SpokenTurn(tts, self.speakers, self._note_audio, self._cancel)
-        self._stt_queue: queue.Queue = queue.Queue(maxsize=240)
+        # A full mailbox must fit without overwriting the beginning of speech.
+        self._stt_queue: queue.Queue = queue.Queue(maxsize=int(MAX_MAIL_DRAIN_S / FRAME_S) + 240)
+        self._mic_lock = threading.Lock()
+        self._stt_frame_ms = 0.0
+        self._stt_slow_logged_at = 0.0
+        self._stt_dropped = 0
+        self._stt_reset_pending = threading.Event()
+        self._stt_unheard = deque(maxlen=round(STT_REPLAY_S / FRAME_S))
+        self._stt_wordless_frames = 0
+        self._stt_raw_words = 0
+        self._stt_replaying = False
         self._pieces: list[str] = []
         self._last_piece = ""
         self._timer: threading.Timer | None = None
@@ -683,7 +765,9 @@ class CodingVoice:
         self._inject_at_ms = 0
         # Endpointing: when the current utterance started + keep-open state.
         self._utterance_start = 0.0
-        self._last_word_at = 0.0
+        # "no word yet" baseline = now, so the STT-blind alarm measures
+        # silence from startup instead of from the epoch.
+        self._last_word_at = time.time()
         # Agent-busy: while a turn of THIS session is running, the STT model
         # is OFF (zero GPU for the agent's thinking); the Pro TTS buffers
         # the reply and speaks it at turn end, the pocket TTS speaks it
@@ -696,8 +780,25 @@ class CodingVoice:
         # turn/end (stream gap) and must release — see _on_snapshot.
         self._busy_since_seq = 0
         self._mailbox: deque = deque(maxlen=3750)  # 5 min of 80 ms frames
-        self._mail_left = 0  # queued frames still to transcribe as mailbox
-        self._mail_skip = 0  # stale (pre-busy) frames ahead of the mailbox
+        # Mic/STT diagnostics: counters behind the two _mic_watcher alarms.
+        # The mic path used to be log-silent, so a dropped utterance was
+        # invisible — these make both failure signatures show up in the log.
+        self._mic_last_frame_at = 0.0
+        self._mic_own_audio = 0    # frames dropped: our own audio in the air
+        self._mic_mail = 0         # frames redirected to the mailbox
+        self._mic_to_stt = 0       # frames handed to the STT queue
+        self._mic_silence_since = 0.0
+        self._stt_blind_logged_at = time.time()
+        self._stt_blind_ticks = 0
+        # Web-speaker echo gate: while the DSH web app's speaker is playing
+        # the agent's voice, the kit writes ~/.dsh/voice-chat/speaking.json
+        # (epoch-ms "until"). Those mic frames are that voice, not Martin —
+        # dropped like our own reply audio. Re-checked at most 2x/s.
+        self._web_speaking_on = False
+        self._web_speaking_check_at = 0.0
+        self._mic_web_echo = 0        # frames dropped: web speaker playing
+        threading.Thread(target=self._mic_watcher, daemon=True,
+                         name="mic-watcher").start()
 
     # ------------------------------------------------------------ echo guard
     def _note_audio(self) -> None:
@@ -720,13 +821,43 @@ class CodingVoice:
         return (self.speakers.pending_seconds > 0.05
                 or time.time() < self._audio_end_at)
 
+    def _web_speaking(self) -> bool:
+        """True while the WEB app's speaker is playing the agent's voice
+        (the DSH kit writes ~/.dsh/voice-chat/speaking.json with an
+        epoch-ms "until" whenever it hands audio to the web speaker).
+        Frames in that window are the same echo as our own audio: drop,
+        don't mailbox — it is not the user talking."""
+        now = time.time()
+        if now < self._web_speaking_check_at:
+            return self._web_speaking_on
+        try:
+            with (Path.home() / ".dsh" / "voice-chat" /
+                  "speaking.json").open("r", encoding="utf-8") as f:
+                until_ms = float(json.load(f).get("until", 0))
+            self._web_speaking_on = now * 1000.0 < until_ms
+        except Exception:
+            self._web_speaking_on = False
+        self._web_speaking_check_at = now + 0.5
+        return self._web_speaking_on
+
     # --------------------------------------------------------------- mic in
     def _on_mic_block(self, pcm):
+        with self._mic_lock:
+            self._route_mic_block(pcm)
+
+    def _route_mic_block(self, pcm):
+        self._mic_last_frame_at = time.time()
         # 1) Our own audio in the air (reply drain, canned lines): drop.
         #    Checked BEFORE the mailbox, because that audio must never be
         #    buffered — it would be transcribed at turn end and injected
         #    back as 'user speech' (the self-echo loop).
         if self._speaking():
+            self._mic_own_audio += 1
+            return
+        if self._web_speaking():
+            # The web speaker is playing the agent's voice right now —
+            # this frame is its echo, not the user.
+            self._mic_web_echo += 1
             return
         if self._busy or self.spoken.busy_audio:
             # Keep the GPU 100% free for the agent's thinking and for the
@@ -737,19 +868,26 @@ class CodingVoice:
             # model's CUDA graph capture and silence the whole reply.
             # Note the _speaking() check above still drops frames while
             # our own reply audio is in the air — echo, not the user.)
+            self._mic_mail += 1
             self._mailbox.append(pcm)
             return
         if self._stt_queue.full():
             try:
                 self._stt_queue.get_nowait()
+                self._stt_dropped += 1
             except queue.Empty:
                 pass
         try:
-            self._stt_queue.put_nowait(pcm)
+            self._stt_queue.put_nowait((pcm, False))
+            self._mic_to_stt += 1
         except queue.Full:
             pass
 
     def _drain_mailbox(self) -> None:
+        with self._mic_lock:
+            self._enqueue_mailbox()
+
+    def _enqueue_mailbox(self) -> None:
         """Feed the buffered (busy-period) mic audio into the STT queue.
         Only the most recent MAX_MAIL_DRAIN_S is transcribed: by the time a
         long turn is over, older buffered audio is stale, and replaying
@@ -763,6 +901,27 @@ class CodingVoice:
             for _ in range(n - keep):
                 self._mailbox.popleft()
             n = keep
+        # Speech-energy gate: a mailbox full of silence (the normal case at a
+        # turn boundary — the echo guard drops our own audio, leaving room
+        # noise) makes the STT invent a sentence out of nothing (27/09:
+        # "Praise the Lord." from 26 s of quiet). Drain only when some
+        # 1-second chunk actually sounds like speech.
+        import numpy as np
+
+        frames = list(self._mailbox)
+        chunk_n = max(1, int(round(1.0 / FRAME_S)))
+        peak_rms = 0.0
+        for i in range(0, len(frames), chunk_n):
+            seg = np.concatenate([f.ravel() for f in frames[i:i + chunk_n]])
+            if seg.size:
+                rms = float(np.sqrt(np.mean(np.square(seg))))
+                if rms > peak_rms:
+                    peak_rms = rms
+        if peak_rms < STT_BLIND_RMS:
+            log(f"mailbox: {n * FRAME_S:.0f}s buffered, silence (peak 1-s "
+                f"rms {peak_rms:.4f} < {STT_BLIND_RMS}) — not transcribed")
+            self._mailbox.clear()
+            return
         for pcm in self._mailbox:
             if self._stt_queue.full():
                 try:
@@ -770,20 +929,144 @@ class CodingVoice:
                 except queue.Empty:
                     pass
             try:
-                self._stt_queue.put_nowait(pcm)
+                self._stt_queue.put_nowait((pcm, True))
             except queue.Full:
                 break
         self._mailbox.clear()
-        self._mail_skip = self._stt_queue.qsize()  # stale frames first
-        self._mail_left = n
         log(f"mailbox: transcribing {n * 0.08:.0f}s of buffered speech")
+        started = time.time()
 
-    def _stt_loop(self):
+        def _drain_check():
+            # A mailbox that transcribes to nothing is how a spoken
+            # question vanishes (the 21:24 loss). Only report once the
+            # audio pipeline is quiet, so a still-draining reply can't
+            # fake an empty result.
+            if self._stop.is_set():
+                return
+            if (self.spoken.busy_audio
+                    or self.speakers.pending_seconds > 0.05
+                    or self._stt_queue.qsize() > 0):
+                return
+            if self._last_word_at <= started + 0.01:
+                log(f"mailbox: {n * 0.08:.0f}s transcribed, no words "
+                    "(STT produced nothing — any question asked in that "
+                    "window was lost)")
+
+        chk = threading.Timer(25.0, _drain_check)
+        chk.daemon = True
+        chk.start()
+
+    def _mic_watcher(self) -> None:
+        """Log the two silent-drop signatures of the mic/STT path.
+
+        The path used to log nothing, so a lost utterance (the 18:05
+        incident) left no trace at all. Now one line appears when frames
+        stop arriving (input stall: driver/WASAPI/USB), and when frames
+        are flowing with speech-level audio but the STT produces no words.
+        The normal case stays silent.
+        """
+        while not self._stop.wait(5.0):
+            if self._stop.is_set():
+                return
+            now = time.time()
+            last = self._mic_last_frame_at
+            if last and now - last >= MIC_SILENCE_ALARM_S:
+                if not self._mic_silence_since:
+                    self._mic_silence_since = last
+                    log(f"mic: no frames for {now - last:.0f}s "
+                        "(input callback silent — audio stack stall?)")
+            elif self._mic_silence_since:
+                log(f"mic: frames resumed after "
+                    f"{now - self._mic_silence_since:.0f}s of silence")
+                self._mic_silence_since = 0.0
+            blind = (self._mic_to_stt > 0
+                     and self.mic.input_rms > STT_BLIND_RMS
+                     and not self._busy
+                     and not (self.spoken.busy_audio
+                              or self.spoken.tts_generating)
+                     and now - self._last_word_at >= STT_BLIND_ALARM_S)
+            if blind:
+                # Two consecutive ticks: a one-off rms blip is not speech.
+                self._stt_blind_ticks += 1
+            else:
+                self._stt_blind_ticks = 0
+            if (self._stt_blind_ticks >= 2
+                    and now - self._stt_blind_logged_at > 30):
+                self._stt_blind_logged_at = now
+                log(f"STT blind: speech-level mic audio but no words for "
+                    f"{now - self._last_word_at:.0f}s "
+                    f"(rms={self.mic.input_rms:.4f})")
+            # Recovery belongs to the STT worker. Measuring decoded frames
+            # there also works when pauses keep resetting this RMS alarm.
+
+    def _decode_frame(self, pcm, is_mail: bool) -> bool:
         import torch
 
+        heard = False
+        for ev in self.stt.feed_frame(torch.from_numpy(pcm)):
+            if ev.kind is SttEventKind.WORD:
+                if ev.piece.replace("\u2581", " ").strip():
+                    heard = True
+                    self._stt_raw_words += 1
+                self._on_word(ev.piece, mail=is_mail)
+        return heard
+
+    def _process_stt_frame(self, pcm, is_mail: bool) -> None:
+        """Only called by the decoder thread; never reset a running feed."""
+        import numpy as np
+
+        if self._stt_reset_pending.is_set():
+            self.stt.reset()
+            self._stt_reset_pending.clear()
+            self._stt_unheard.clear()
+            self._stt_wordless_frames = 0
+            log("STT: fresh decoder context after reply")
+        if not np.isfinite(pcm).all():
+            # One NaN can poison streaming state long after its frame ends.
+            pcm = np.nan_to_num(pcm, nan=0.0, posinf=0.0, neginf=0.0)
+            log("STT: replaced non-finite microphone samples")
+        self._stt_unheard.append((pcm, is_mail))
+        try:
+            heard = self._decode_frame(pcm, is_mail)
+        except Exception as exc:
+            log(f"STT decoder error: {exc}; resetting and retrying frame")
+            self.stt.reset()
+            heard = self._decode_frame(pcm, is_mail)
+        if heard:
+            self._stt_unheard.clear()
+            self._stt_wordless_frames = 0
+            return
+        self._stt_wordless_frames += 1
+        if self._stt_wordless_frames * FRAME_S < STT_RECOVERY_S:
+            return
+        # No requirement for continuous loud speech: short questions and
+        # pauses must not leave a wordless decoder stuck for hours. Nothing
+        # already recognised is replayed, so a delivered request isn't sent
+        # twice. Silence gets a cheap reset without needless GPU replay.
+        retry = list(self._stt_unheard)
+        self.stt.reset()
+        self._stt_unheard.clear()
+        self._stt_wordless_frames = 0
+        speech_level = any(float(np.sqrt(np.mean(p * p))) > STT_BLIND_RMS
+                           for p, _ in retry)
+        if speech_level:
+            log(f"STT recovery: reset and retry {len(retry) * FRAME_S:.1f}s of unheard audio")
+            self._stt_replaying = True
+            try:
+                for frame, mail in retry:
+                    while (self.spoken.busy_audio or self.spoken.tts_generating
+                           ) and not self._stop.is_set():
+                        time.sleep(0.2)
+                    if self._stop.is_set():
+                        return
+                    self._decode_frame(frame, mail)
+            finally:
+                self._stt_replaying = False
+
+    def _stt_loop(self):
         while not self._stop.is_set():
             try:
-                pcm = self._stt_queue.get(timeout=0.5)
+                pcm, is_mail = self._stt_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             if self._stop.is_set():
@@ -800,20 +1083,19 @@ class CodingVoice:
                 time.sleep(0.2)
             if self._stop.is_set():
                 break
-            is_mail = False
-            if self._mail_skip > 0:
-                self._mail_skip -= 1
-            elif self._mail_left > 0:
-                self._mail_left -= 1
-                is_mail = True
+            started = time.perf_counter()
             try:
-                events = self.stt.feed_frame(torch.from_numpy(pcm))
+                self._process_stt_frame(pcm, is_mail)
             except Exception as e:
                 log(f"STT frame failed: {e}")
                 continue
-            for ev in events:
-                if ev.kind is SttEventKind.WORD:
-                    self._on_word(ev.piece, mail=is_mail)
+            elapsed = (time.perf_counter() - started) * 1000
+            self._stt_frame_ms = self._stt_frame_ms * .9 + elapsed * .1
+            if time.time() - self._stt_slow_logged_at >= 30:
+                self._stt_slow_logged_at = time.time()
+                log(f"STT timing: {self._stt_frame_ms:.0f}ms per 80ms frame; "
+                    f"queued={self._stt_queue.qsize() * FRAME_S:.1f}s; dropped={self._stt_dropped}; "
+                    f"words={self._stt_raw_words}; rms={self.mic.input_rms:.4f}")
             # END / SILENCE deliberately ignored (word-gap endpointing).
 
     # ------------------------------------------------------------- words
@@ -850,19 +1132,23 @@ class CodingVoice:
             self._timer = None
         if not self._pieces:
             return
-        text = "".join(self._pieces)
+        text = "".join(self._pieces).replace("\u2581", " ").strip()
         words = len(text.split())
-        last = (self._last_piece or "").lstrip("\u2581").strip()
-        final = last in SENTENCE_END_PUNCT
+        final = text.endswith(tuple(SENTENCE_END_PUNCT))
         silence = time.time() - self._last_word_at
         age = time.time() - self._utterance_start
+        # A decoding pause is not the end of the user's speech. Never send
+        # a partial transcript while captured audio is still waiting behind it.
+        if self._stt_queue.qsize() > 2 or getattr(self, '_stt_replaying', False):
+            self._arm_timer()
+            return
         if final and silence >= self._final_silence_s:
             # Ended properly, and the user has stayed quiet long enough that
             # a mid-sentence breath (a spurious full stop) is ruled out.
             pass
-        elif (not final) and 3 <= words <= 12 and silence >= COMMAND_SILENCE_S:
-            # A short command the user has really stopped speaking
-            # ("fix the login bug"). No-punctuation fragments shorter than
+        elif (not final) and words >= 3 and silence >= COMMAND_SILENCE_S:
+            # A pause ends longer utterances too; missing punctuation must
+            # not force a two-minute wait. Fragments shorter than
             # 3 words are never sent this way — they are lead-ins
             # ("so, can ...") that belong to a longer utterance.
             pass
@@ -963,6 +1249,7 @@ class CodingVoice:
                     "reply spoken live")
         else:
             self._busy_since_seq = 0
+            self._stt_reset_pending.set()
             self._apply_mood()
             self.spoken.set_paused(False)
             if self.tts_pro:
@@ -1033,14 +1320,22 @@ class CodingVoice:
             return
         t = ev.get("type")
         if t == "assistant/chunk":
+            seq = ev.get("seq") or 0
+            if isinstance(seq, int) and seq <= self._chunk_seq:
+                # A stream cycle can re-deliver (or reorder) tail chunks of
+                # an already-replayed turn. Re-arming busy on one of those
+                # pinned the mic closed for a whole 50 s cycle on a
+                # finished turn (the 21:24 stuck-busy incident); re-feeding
+                # the chunk would double-speak it. The watermark already
+                # covers it — drop it.
+                return
             if not self._busy:
-                self._busy_since_seq = ev.get("seq") or 0
+                self._busy_since_seq = seq if isinstance(seq, int) else 0
             self._set_busy(True)
             chunk = (ev.get("data") or {}).get("chunk")
             if isinstance(chunk, dict):
                 self._last_chunk_at = time.time()
                 self.spoken.feed(chunk)
-            seq = ev.get("seq") or 0
             if isinstance(seq, int) and seq > self._chunk_seq:
                 self._chunk_seq = seq
         elif t == "assistant/message":
@@ -1063,6 +1358,7 @@ class CodingVoice:
         records = snap.get("records") or []
         last_msg = None
         max_seq = 0
+        last_end = 0  # seq of the newest turn/end in this snapshot
         for rec in records:
             if rec.get("type") != "event":
                 continue
@@ -1070,8 +1366,11 @@ class CodingVoice:
             seq = ev.get("seq") or 0
             if isinstance(seq, int):
                 max_seq = max(max_seq, seq)
-                if ev.get("type") == "assistant/message":
+                et = ev.get("type")
+                if et == "assistant/message":
                     last_msg = ev
+                elif et == "turn/end":
+                    last_end = max(last_end, seq)
 
         header = snap.get("header") or {}
         snap_sid = header.get("id") if isinstance(header, dict) else None
@@ -1140,13 +1439,22 @@ class CodingVoice:
                 if ev.get("type") == "assistant/chunk":
                     seq = ev.get("seq") or 0
                     if seq > self._chunk_seq:
+                        self._chunk_seq = seq
+                        if seq <= last_end:
+                            # The turn already ended in this snapshot: the
+                            # committed message (spoken above via
+                            # resume_with) owns this text. Feeding the
+                            # chunks again would double-speak the tail, and
+                            # re-arming busy would pin the mic closed on a
+                            # finished turn (the 21:24 stuck-busy incident).
+                            # Watermark only.
+                            continue
                         # A new chunk means a turn is in flight: re-arm busy
                         # exactly like the live path does, so a misfired
                         # release can't leave the mic live mid-reply.
                         if not self._busy:
                             self._busy_since_seq = seq
                             self._set_busy(True)
-                        self._chunk_seq = seq
                         chunk = (ev.get("data") or {}).get("chunk")
                         if isinstance(chunk, dict):
                             self.spoken.feed(chunk)
@@ -1157,6 +1465,11 @@ class CodingVoice:
                 seq = ev.get("seq") or 0
                 if et == "chunkrow/text-chunks" and seq > self._chunk_seq:
                     self._chunk_seq = seq
+                    if seq <= last_end:
+                        # Ended turn: watermark only (same reasoning as the
+                        # assistant/chunk branch above) — no re-arm, no
+                        # re-feed.
+                        continue
                     if not self._busy:
                         self._busy_since_seq = seq
                     self._set_busy(True)  # a turn is in flight
@@ -1202,7 +1515,8 @@ class CodingVoice:
     def start(self) -> None:
         self.speakers.start()
         self.mic.start()
-        threading.Thread(target=self._stt_loop, daemon=True).start()
+        self._stt_thread = threading.Thread(target=self._stt_loop, daemon=True)
+        self._stt_thread.start()
         threading.Thread(target=self._floor_loop, daemon=True).start()
 
         def _ws():
@@ -1216,8 +1530,10 @@ class CodingVoice:
     def stop(self) -> None:
         self._stop.set()
         self._cancel.set()
-        self.stt.close()
         self.mic.close()
+        self._stt_thread.join(timeout=5)
+        if not self._stt_thread.is_alive():
+            self.stt.close()
         self.speakers.close()
 
 
@@ -1392,12 +1708,29 @@ def main() -> int:
     ap.add_argument("--gui-home", default=None,
                     help="DSH home (default: $DSH_HOME or ~/.dsh)")
     ap.add_argument("--tts-engine", default="pocket",
-                    choices=["pocket", "kyutai16b"],
+                    choices=["pocket", "kyutai16b", "qwen3tts", "qwen3design",
+                              "qwen3gguf", "qwen3ggufbase", "none"],
                     help="TTS backend: pocket = the small local model "
                          "(default, unchanged); kyutai16b = the big Kyutai "
                          "TTS 1.6B model, int8-quantised on the GPU "
                          "(~2 GB extra VRAM, slower to load, much better "
-                         "voice). English only.")
+                         "voice); qwen3tts = the Qwen3-TTS 12Hz 0.6B model "
+                         "(bf16, ~2.2 GB VRAM) voice-cloned from the pro "
+                         "clip; qwen3design = Qwen3-TTS 1.7B VoiceDesign "
+                         "with a described voice and expressive moods; "
+                         "qwen3gguf = GPU Q8 VoiceDesign, complete "
+                          "sentences; qwen3ggufbase = GPU Q8 Base with a "
+                          "fixed registered reference voice (no moods); "
+                           "none = no local TTS at all (the web speaker "
+                           "system speaks the replies instead).")
+    ap.add_argument("--qwen3tts-model", default=None,
+                    help="local Qwen model directory; default depends on "
+                         "engine (0.6B Base or 1.7B VoiceDesign)")
+    from .qwen3_design_engine import add_design_arguments
+    add_design_arguments(ap)
+    ap.add_argument("--qwen3tts-ref", default=None,
+                    help="qwen3tts: reference clip to clone the voice from "
+                         "(default: the vctk/p277_023 pro clip)")
     ap.add_argument("--tts-voice", default="anna")
     ap.add_argument("--tts-language", default="english")
     ap.add_argument("--tts-quantize", default="int4",
@@ -1406,7 +1739,9 @@ def main() -> int:
                          "(default; 'int4' is accepted and means int8) or "
                          "none (full precision, ~3.7 GB VRAM)")
     ap.add_argument("--tts-moods", default=None, choices=["auto", "off"],
-                    help="Pro engine only. auto (default) = each reply is "
+                    help="qwen3design/qwen3gguf: auto enables expressive delivery, "
+                         "off keeps the voice description only. "
+                         "Kyutai Pro: auto (default) = each reply is "
                          "spoken in the EARS p003 mood that fits how the "
                          "turn went (23 moods, preloaded at start, neutral "
                          "fallback); off = one fixed voice: --tts-voice, "

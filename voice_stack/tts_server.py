@@ -107,13 +107,26 @@ class Handler(BaseHTTPRequestHandler):
             if engine is None:
                 return self._json(500, {"ok": False,
                                         "error": "no TTS engines available"})
-        try:
-            engine.load()
-            samples, rate = engine.synthesize(text, voice)
-        except Exception as e:
-            log.exception("synthesis failed (%s)", engine.name)
+        # Try the chosen engine first, then the rest in registry order: a
+        # GPU engine that cannot load right now (e.g. VRAM taken by the LLM)
+        # falls back to the next engine instead of erroring, so the device
+        # always gets a voice.
+        tried = []
+        samples = rate = None
+        for cand in [engine] + [e for e in engines.engines() if e is not engine]:
+            try:
+                cand.load()
+                samples, rate = cand.synthesize(text, voice)
+                if cand is not engine:
+                    log.warning("engine %s failed; fell back to %s",
+                                engine.name, cand.name)
+                break
+            except Exception as e:
+                log.warning("engine %s failed: %s", cand.name, e)
+                tried.append(cand.name)
+        if samples is None:
             return self._json(500, {"ok": False,
-                                    "error": f"synthesis failed: {e}"})
+                                    "error": f"synthesis failed on: {tried}"})
         try:
             wav = _wav(samples, rate)
         except Exception as e:

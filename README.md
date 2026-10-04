@@ -1,5 +1,10 @@
 # TTSTT — Local Voice Stack
 
+The GPU Q8 Qwen 1.7B VoiceDesign voice is available through
+`run_qwen3_voice.bat` / `--tts-engine qwen3gguf`. It generates complete
+sentences and supports mood instructions. Setup, benchmark results and the
+alternative Python adapter are in [QWEN_VOICE_DESIGN.md](QWEN_VOICE_DESIGN.md).
+
 **Mic → Kyutai STT 1B (GPU) → DSH voice session (Qwen 27B via llama.cpp) → Pocket TTS (CPU) → speakers**
 
 Fully local. The "brain" is a real **DeepSeek Harness (DSH) session** — not a
